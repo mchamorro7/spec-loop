@@ -20,9 +20,9 @@
 
 ## 3. Invocación pelada
 
-- [ ] 3.1 `spec-loop` sin verbo: preflight, imprimir las olas, imprimir los dos verbos al pie, salir sin gastar tokens
-- [ ] 3.2 Formato de impresión de olas legible, que haga evidente el corte por capa (una ola por tarea)
-- [ ] 3.3 Verificar el gate del proyecto sobre la base como primer paso del preflight, antes de crear ningún worktree
+- [x] 3.1 `spec-loop` sin verbo: preflight, imprimir las olas, imprimir los dos verbos al pie, salir sin gastar tokens
+- [x] 3.2 Formato de impresión de olas legible, que haga evidente el corte por capa (una ola por tarea)
+- [x] 3.3 Verificar el gate del proyecto sobre la base como primer paso del preflight, antes de crear ningún worktree
 
 ## 4. Pipeline de una tarea, con concurrencia 1
 

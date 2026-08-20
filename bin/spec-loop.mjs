@@ -11,6 +11,10 @@
 // `spec-loop status`. See specs/wave-execution/spec.md.
 
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { cpus } from "node:os";
+import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 // ---------------------------------------------------------------------------
@@ -521,6 +525,37 @@ export function deriveState(_events) {
   throw new Error("deriveState: not yet implemented (task 7.1)");
 }
 
+/**
+ * Render the wave plan the way `spec-loop` prints it: readable, and honest
+ * about a layer cut (one task per wave) so that's visible for free, before
+ * spending a token. See task 3.2.
+ */
+export function formatWaves(changeName, waves) {
+  const lines = [`spec-loop · ${changeName}`, ""];
+
+  waves.forEach((wave, idx) => {
+    lines.push(`Ola ${idx + 1}`);
+    for (const t of wave) {
+      const needs = t.needs.length > 0 ? `   (needs: ${t.needs.join(", ")})` : "";
+      lines.push(`  ${t.id}  ${t.description}${needs}`);
+    }
+    lines.push("");
+  });
+
+  const isLayerCut = waves.length > 1 && waves.every((w) => w.length === 1);
+  if (isLayerCut) {
+    lines.push(
+      "aviso: cada ola tiene una sola tarea. Puede ser un corte por capa, no por",
+      "feature vertical -- revisá tasks.md antes de correr.",
+      "",
+    );
+  }
+
+  lines.push(`spec-loop run       ejecuta ${changeName}`);
+  lines.push(`spec-loop status    imprime el estado`);
+  return lines.join("\n") + "\n";
+}
+
 // ---------------------------------------------------------------------------
 // EFFECTS — worktrees, spawns, git, the filesystem, and the CLI dispatch
 // below are the only places allowed to do those things. The task pipeline
@@ -529,9 +564,127 @@ export function deriveState(_events) {
 // it has a caller.
 // ---------------------------------------------------------------------------
 
+const REPO_ROOT = process.cwd();
+const CHANGES_DIR = join(REPO_ROOT, "openspec", "changes");
+const ROADMAP_PATH = join(REPO_ROOT, "openspec", "roadmap.md");
+const CONFIG_PATH = join(REPO_ROOT, "spec-loop.yaml");
+
+function readIfExists(path) {
+  return existsSync(path) ? readFileSync(path, "utf8") : null;
+}
+
+/** Concatenate every .md file under `dir`, recursively — the spec delta text preflight checks `proves` against. */
+function collectMarkdown(dir) {
+  if (!existsSync(dir)) return "";
+  const parts = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) parts.push(collectMarkdown(full));
+    else if (entry.name.endsWith(".md")) parts.push(readFileSync(full, "utf8"));
+  }
+  return parts.join("\n");
+}
+
+/** Scan openspec/changes/* for resolveChange()'s `activeChanges` input. */
+function listActiveChanges() {
+  if (!existsSync(CHANGES_DIR)) return [];
+  return readdirSync(CHANGES_DIR, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => {
+      const tasksPath = join(CHANGES_DIR, e.name, "tasks.md");
+      const hasTasks = existsSync(tasksPath);
+      let complete = false;
+      if (hasTasks) {
+        const { tasks, errors } = parseTasks(readFileSync(tasksPath, "utf8"));
+        // A file that fails to parse, or has zero tasks, is not "complete" —
+        // `.every()` on an empty array is vacuously true, which would wrongly
+        // hide a broken tasks.md from ever being selected as the current change.
+        complete = errors.length === 0 && tasks.length > 0 && tasks.every((t) => t.checked);
+      }
+      return { name: e.name, hasTasks, complete };
+    });
+}
+
+function loadRepoConfig() {
+  const text = readIfExists(CONFIG_PATH);
+  if (text === null) {
+    return { config: null, errors: ["no existe spec-loop.yaml en la raíz del repo"] };
+  }
+  return loadConfig(text, cpus().length);
+}
+
+function runShell(command, cwd) {
+  const result = spawnSync(command, { shell: true, cwd, encoding: "utf8" });
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? "",
+  };
+}
+
+/**
+ * Preflight per specs/wave-execution/spec.md: gate on the base, parse,
+ * validate the eight rules, partition into waves — in that order, before
+ * creating any worktree or spawning any agent. Shared by `bare` and (once
+ * group 4 wires up execution) `run`.
+ */
+function preflightCurrentChange(config) {
+  const gateResult = runShell(config.gate, REPO_ROOT);
+  if (gateResult.code !== 0) {
+    return {
+      ok: false,
+      errors: [`el gate está rojo antes de empezar:\n${gateResult.stderr || gateResult.stdout}`],
+    };
+  }
+
+  const roadmapText = readIfExists(ROADMAP_PATH);
+  const activeChanges = listActiveChanges();
+  const resolved = resolveChange(roadmapText, activeChanges);
+  if (resolved.errors.length > 0) return { ok: false, errors: resolved.errors };
+  if (resolved.change === null) return { ok: false, message: resolved.message };
+
+  const changeDir = join(CHANGES_DIR, resolved.change);
+  const tasksText = readFileSync(join(changeDir, "tasks.md"), "utf8");
+  const { tasks, errors: parseErrors } = parseTasks(tasksText);
+  if (parseErrors.length > 0) {
+    return { ok: false, errors: parseErrors.map((e) => `tasks.md:${e.line}: ${e.message}`) };
+  }
+
+  const specDeltaText = collectMarkdown(join(changeDir, "specs"));
+  const { errors: ruleErrors } = preflight(tasks, { gateCommand: config.gate, specDeltaText });
+  if (ruleErrors.length > 0) return { ok: false, errors: ruleErrors };
+
+  const { waves, errors: waveErrors } = planWaves(tasks);
+  if (waveErrors.length > 0) return { ok: false, errors: waveErrors };
+
+  return { ok: true, change: resolved.change, waves };
+}
+
+function printErrors(errors) {
+  for (const e of errors) process.stderr.write(`error: ${e}\n`);
+}
+
 /** `spec-loop` — preflight, print the waves, exit. Costs zero tokens. */
 async function bare() {
-  throw new Error("bare invocation: not yet implemented (task 3.1)");
+  const { config, errors: configErrors } = loadRepoConfig();
+  if (configErrors.length > 0) {
+    printErrors(configErrors);
+    process.exitCode = 2;
+    return;
+  }
+
+  const result = preflightCurrentChange(config);
+  if (result.message) {
+    process.stdout.write(result.message + "\n");
+    return;
+  }
+  if (!result.ok) {
+    printErrors(result.errors);
+    process.exitCode = 2;
+    return;
+  }
+
+  process.stdout.write(formatWaves(result.change, result.waves));
 }
 
 /** `spec-loop run` — preflight, print the waves, execute. */
