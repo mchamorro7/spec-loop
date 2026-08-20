@@ -1,0 +1,23 @@
+{
+  "name": "spec-loop",
+  "version": "0.1.0",
+  "description": "In-house harness for parallel, contract-verified feature development on top of OpenSpec.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "spec-loop": "bin/spec-loop.mjs"
+  },
+  "scripts": {
+    "gate": "eslint 'bin/**/*.mjs' 'test/**/*.mjs' --no-error-on-unmatched-pattern",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.19.0",
+    "eslint": "^9.19.0"
+  }
+}
