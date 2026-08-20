@@ -81,14 +81,21 @@ forma determinista y sin red.
 En un change desde cero el archivo de test no existe al momento del preflight: lo escribe el
 implementer. Un chequeo sobre un archivo inexistente es un chequeo que no corre.
 
-El orden dentro del pipeline de una tarea es: `verify` exit 0 → lint del test → red check →
-congelar la huella → scope check → commit del runner.
+El orden dentro del pipeline de una tarea es: `verify` exit 0 → **commit del runner** → lint
+del test → congelar la huella → red check → scope check. El commit va primero, no último: es
+la corrección de D5.
 
 ### D5 · El runner commitea, no el implementer
 
-El red check restaura archivos con git, así que solo funciona sobre trabajo commiteado. En v3.1
-quien commitea es el implementer, por una instrucción de prompt: si la omite, el red check
-destruye el trabajo en silencio y la tarea sale roja por una causa inventada.
+El red check restaura archivos con git, así que solo funciona sobre trabajo commiteado — y el
+scope check compara `<base>..<task-branch>` por ref, lo que también exige que exista un commit
+en `task-branch`. Las dos verificaciones siguientes dependen de que el commit ya esté hecho, así
+que el commit tiene que ser el primer paso después de `verify`, no el último: una versión previa
+de este documento tenía el orden invertido, contradiciendo su propia razón de ser (queda
+corregido en D4).
+
+En v3.1 quien commitea es el implementer, por una instrucción de prompt: si la omite, el red
+check destruye el trabajo en silencio y la tarea sale roja por una causa inventada.
 
 El runner commitea al pasar `verify`, con un trailer de tarea y un trailer de requisito. El
 trailer de requisito importa por separado: es la única parte de la trazabilidad que sobrevive al

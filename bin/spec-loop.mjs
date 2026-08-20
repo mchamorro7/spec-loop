@@ -12,9 +12,9 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { cpus } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 // ---------------------------------------------------------------------------
@@ -556,6 +556,118 @@ export function formatWaves(changeName, waves) {
   return lines.join("\n") + "\n";
 }
 
+const MAX_TRUNCATED_BYTES = 4096;
+const FIRST_BLOCK_LINES = 20;
+const LAST_BLOCK_LINES = 20;
+
+/**
+ * First error block + last 20 lines, capped at 4 KB — what gets reinjected
+ * into the next attempt. Without this, attempt 3 starts with the context
+ * already poisoned by a multi-thousand-line stderr dump. See task 4.4.
+ */
+export function truncateError(stderrText) {
+  const text = stderrText ?? "";
+  if (text === "") return "";
+  const lines = text.split("\n");
+  const firstErrorIdx = Math.max(0, lines.findIndex((l) => ERROR_LINE_RE.test(l)));
+  const firstBlockEnd = Math.min(lines.length, firstErrorIdx + FIRST_BLOCK_LINES);
+  const tailStart = Math.max(0, lines.length - LAST_BLOCK_LINES);
+
+  const selected =
+    tailStart <= firstBlockEnd
+      ? lines.slice(firstErrorIdx)
+      : [...lines.slice(firstErrorIdx, firstBlockEnd), "…", ...lines.slice(tailStart)];
+
+  const joined = selected.join("\n");
+  const bytes = Buffer.from(joined, "utf8");
+  return bytes.length <= MAX_TRUNCATED_BYTES
+    ? joined
+    : bytes.subarray(0, MAX_TRUNCATED_BYTES).toString("utf8");
+}
+
+const NEEDS_SCOPE_RE = /^NEEDS-SCOPE:\s*(.+)$/m;
+
+/** The implementer's only way to ask for scope: a fixed line, never a mid-turn question. See task 4.6. */
+export function detectNeedsScope(implementerOutputText) {
+  const m = NEEDS_SCOPE_RE.exec(implementerOutputText ?? "");
+  return m ? m[1].trim() : null;
+}
+
+const DURATION_RE = /^(\d+)([smh])$/;
+const DURATION_UNIT_MS = { s: 1000, m: 60_000, h: 3_600_000 };
+
+/** Parse a config duration ("20m") into milliseconds, or null if malformed. */
+export function parseDurationMs(text) {
+  const m = DURATION_RE.exec((text ?? "").trim());
+  return m ? Number(m[1]) * DURATION_UNIT_MS[m[2]] : null;
+}
+
+/**
+ * The prompt an implementer spawn receives: the task contract, its prose,
+ * and — from the second attempt on — the previous attempt's truncated
+ * error. Nothing else; see "Presupuesto de contexto por spawn".
+ */
+export function buildImplementerPrompt(task, previousErrorTruncated = null) {
+  const lines = [
+    `id: ${task.id}`,
+    `proves: ${task.proves}`,
+    `files:`,
+    ...task.files.map((f) => `  - ${f}`),
+    `verify: ${task.verify}`,
+  ];
+  if (task.needs.length > 0) lines.push(`needs: ${JSON.stringify(task.needs)}`);
+  if (task.redCheck.mode === "skip") lines.push(`red-check: skip: ${task.redCheck.reason}`);
+
+  let out = lines.join("\n");
+  if (task.prose) out += `\n\n${task.prose}`;
+  if (previousErrorTruncated) {
+    out += `\n\n--- el intento anterior falló con ---\n${previousErrorTruncated}`;
+  }
+  return out;
+}
+
+/**
+ * The loop's only decision, isolated from the I/O around it: given this
+ * attempt's verify result and the signature history, what happens next.
+ * See task 4.5.
+ */
+export function decideAttemptOutcome({ attempt, maxAttempts, exitCode, signature, previousSignature }) {
+  if (exitCode === 0) return { status: "verified" };
+  if (previousSignature !== null && signature === previousSignature) return { status: "stuck" };
+  if (attempt >= maxAttempts) return { status: "blocked" };
+  return { status: "continue" };
+}
+
+const STATUS_ICON = {
+  verified: "✅",
+  stuck: "⚠️",
+  blocked: "❌",
+  "needs-scope": "⚠️",
+};
+
+/** Render one events.jsonl record as the live stdout line for it. See task 4.8. */
+export function formatEventLine(event) {
+  const time = new Date(event.ts).toISOString().slice(11, 19);
+  const head = `${time}  ${event.task}`;
+  switch (event.event) {
+    case "attempt_start":
+      return `${head}  attempt ${event.attempt}`;
+    case "verify": {
+      const sig = event.sig ? `  sig ${event.sig}` : "";
+      return `${head}  verify exit ${event.exit}${sig}`;
+    }
+    case "needs_scope":
+      return `${head}  NEEDS-SCOPE: ${event.note}`;
+    case "closed": {
+      const icon = STATUS_ICON[event.status] ?? "";
+      const cost = typeof event.cost_usd === "number" ? `  $${event.cost_usd.toFixed(2)}` : "";
+      return `${head}  ${icon} ${event.status}  ${event.attempts} attempts${cost}`;
+    }
+    default:
+      return `${head}  ${event.event}`;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // EFFECTS — worktrees, spawns, git, the filesystem, and the CLI dispatch
 // below are the only places allowed to do those things. The task pipeline
@@ -662,6 +774,192 @@ function preflightCurrentChange(config) {
 
 function printErrors(errors) {
   for (const e of errors) process.stderr.write(`error: ${e}\n`);
+}
+
+function runGit(args, cwd) {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+function worktreeDir(repoRoot, taskId) {
+  return join(repoRoot, ".spec-loop", "wt", taskId);
+}
+
+function branchName(changeName, taskId) {
+  return `spec-loop/${changeName}/${taskId}`;
+}
+
+/**
+ * Clean any stray worktree/branch left by an earlier interrupted run of this
+ * exact task, then create a fresh one from `baseRef` — the wave's base, not
+ * a fixed ref, per D6: it's re-read at the start of every wave so later
+ * waves branch from a tree that contains the earlier ones. `repoRoot`
+ * defaults to the real repo but is injectable so this is testable against a
+ * throwaway git repo. See task 4.1.
+ */
+function ensureWorktree(changeName, taskId, baseRef, repoRoot = REPO_ROOT) {
+  const dir = worktreeDir(repoRoot, taskId);
+  const branch = branchName(changeName, taskId);
+
+  if (existsSync(dir)) runGit(["worktree", "remove", "--force", dir], repoRoot);
+  runGit(["branch", "-D", branch], repoRoot); // no-op if the branch doesn't exist
+
+  const add = runGit(["worktree", "add", "-b", branch, dir, baseRef], repoRoot);
+  if (add.code !== 0) {
+    throw new Error(`no se pudo crear el worktree de "${taskId}": ${add.stderr || add.stdout}`);
+  }
+  return { dir, branch };
+}
+
+const ALLOWED_IMPLEMENTER_TOOLS =
+  "Bash(git *),Bash(npm *),Bash(npx *),Bash(pnpm *),Bash(yarn *),Read,Edit,Write,Glob,Grep";
+const IMPLEMENTER_MD_PATH = join(REPO_ROOT, "agents", "implementer.md");
+const DEFAULT_IMPLEMENTER_MAX_TURNS = "30";
+
+/**
+ * Production implementer spawn: `claude -p` with the exact context budget
+ * from "Presupuesto de contexto por spawn" — no MCP servers, a turn cap, a
+ * timeout, and only the tools listed above. Swappable via ctx.spawnImplementer
+ * so the loop's wiring is testable without invoking the real CLI.
+ */
+function spawnImplementer(prompt, { worktreeDir: cwd, config }) {
+  const timeoutMs = parseDurationMs(config.timeout) ?? 20 * 60_000;
+  const result = spawnSync(
+    "claude",
+    [
+      "-p",
+      prompt,
+      "--append-system-prompt-file",
+      IMPLEMENTER_MD_PATH,
+      "--model",
+      config.model,
+      "--max-turns",
+      DEFAULT_IMPLEMENTER_MAX_TURNS,
+      "--strict-mcp-config",
+      "--permission-mode",
+      "acceptEdits",
+      "--allowedTools",
+      ALLOWED_IMPLEMENTER_TOOLS,
+      "--output-format",
+      "json",
+    ],
+    { cwd, encoding: "utf8", timeout: timeoutMs },
+  );
+
+  let parsed = {};
+  try {
+    parsed = JSON.parse(result.stdout ?? "");
+  } catch {
+    parsed = {};
+  }
+
+  return {
+    resultText: typeof parsed.result === "string" ? parsed.result : (result.stdout ?? ""),
+    costUsd: typeof parsed.total_cost_usd === "number" ? parsed.total_cost_usd : 0,
+  };
+}
+
+/** Append one record to events.jsonl. Only the runner writes here — see task 4.7. */
+function appendEvent(eventsPath, event) {
+  mkdirSync(dirname(eventsPath), { recursive: true });
+  const record = event.ts ? event : { ts: new Date().toISOString(), ...event };
+  appendFileSync(eventsPath, JSON.stringify(record) + "\n");
+}
+
+function round2(n) {
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * Run one task's full attempt loop inside its own worktree: fresh context
+ * per spawn, the runner deciding via `verify`'s exit code (never the
+ * agent's own word), and every transition appended to events.jsonl as it
+ * happens. `ctx.spawnImplementer` is injectable for testing; production
+ * code leaves it as the default, which calls the real `claude` CLI. See
+ * group 4 as a whole.
+ */
+export function runTaskPipeline(task, ctx) {
+  const {
+    changeName,
+    baseRef,
+    config,
+    eventsPath,
+    repoRoot = REPO_ROOT,
+    spawnImplementer: spawnFn = spawnImplementer,
+    emit = (event) => process.stdout.write(formatEventLine(event) + "\n"),
+  } = ctx;
+
+  const record = (event) => {
+    const full = { ts: new Date().toISOString(), task: task.id, ...event };
+    appendEvent(eventsPath, full);
+    emit(full);
+    return full;
+  };
+
+  const worktree = ensureWorktree(changeName, task.id, baseRef, repoRoot);
+
+  const startedAt = Date.now();
+  let previousSignature = null;
+  let previousErrorTruncated = null;
+  let totalCostUsd = 0;
+
+  for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
+    record({ event: "attempt_start", attempt });
+
+    const prompt = buildImplementerPrompt(task, previousErrorTruncated);
+    const spawned = spawnFn(prompt, { worktreeDir: worktree.dir, config, attempt });
+    totalCostUsd += spawned.costUsd ?? 0;
+
+    const scopeNote = detectNeedsScope(spawned.resultText);
+    if (scopeNote) {
+      record({ event: "needs_scope", attempt, note: scopeNote });
+      record({
+        event: "closed",
+        status: "needs-scope",
+        attempts: attempt,
+        cost_usd: round2(totalCostUsd),
+        wall_s: Math.round((Date.now() - startedAt) / 1000),
+      });
+      return { status: "needs-scope", attempts: attempt, worktree, note: scopeNote };
+    }
+
+    const verifyResult = runShell(task.verify, worktree.dir);
+    const passed = verifyResult.code === 0;
+    const rawOutput = verifyResult.stderr || verifyResult.stdout;
+    const signature = passed ? null : errorSignature(rawOutput);
+
+    // The full output is kept in events.jsonl (durable, for later reading);
+    // only the truncated form ever goes back into a prompt or to stdout.
+    record({
+      event: "verify",
+      attempt,
+      exit: verifyResult.code,
+      ...(passed ? {} : { sig: signature, stderr: rawOutput }),
+    });
+
+    const outcome = decideAttemptOutcome({
+      attempt,
+      maxAttempts: config.maxAttempts,
+      exitCode: verifyResult.code,
+      signature,
+      previousSignature,
+    });
+
+    if (outcome.status === "continue") {
+      previousSignature = signature;
+      previousErrorTruncated = truncateError(rawOutput);
+      continue;
+    }
+
+    record({
+      event: "closed",
+      status: outcome.status,
+      attempts: attempt,
+      cost_usd: round2(totalCostUsd),
+      wall_s: Math.round((Date.now() - startedAt) / 1000),
+    });
+    return { status: outcome.status, attempts: attempt, worktree };
+  }
 }
 
 /** `spec-loop` — preflight, print the waves, exit. Costs zero tokens. */

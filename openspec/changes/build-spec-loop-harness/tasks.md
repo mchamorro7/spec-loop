@@ -26,23 +26,23 @@
 
 ## 4. Pipeline de una tarea, con concurrencia 1
 
-- [ ] 4.1 Crear y limpiar el worktree y la rama por tarea; base = HEAD de la rama del change al arrancar la ola (D6)
-- [ ] 4.2 Spawn del implementer con presupuesto de contexto acotado: sin servidores de herramientas externas y sin cambiar credenciales, tope de turnos, timeout, permisos mínimos
-- [ ] 4.3 El runner corre `verify` en el worktree y usa su exit code como única señal
-- [ ] 4.4 Loop de intentos con tope total; inyección del error anterior truncado (primer bloque + últimas 20 líneas, tope 4 KB)
-- [ ] 4.5 Corte por firma repetida → `stuck`; corte por intentos agotados → `blocked`
-- [ ] 4.6 Detectar la señal de alcance insuficiente del implementer → `needs-scope`, sin más intentos
-- [ ] 4.7 `events.jsonl`: append-only, escrito solo por el runner, una entrada por transición
-- [ ] 4.8 Salida estándar en vivo: una línea por transición, sin volcar la salida cruda de los agentes
+- [x] 4.1 Crear y limpiar el worktree y la rama por tarea; base = HEAD de la rama del change al arrancar la ola (D6)
+- [x] 4.2 Spawn del implementer con presupuesto de contexto acotado: sin servidores de herramientas externas y sin cambiar credenciales, tope de turnos, timeout, permisos mínimos
+- [x] 4.3 El runner corre `verify` en el worktree y usa su exit code como única señal
+- [x] 4.4 Loop de intentos con tope total; inyección del error anterior truncado (primer bloque + últimas 20 líneas, tope 4 KB)
+- [x] 4.5 Corte por firma repetida → `stuck`; corte por intentos agotados → `blocked`
+- [x] 4.6 Detectar la señal de alcance insuficiente del implementer → `needs-scope`, sin más intentos
+- [x] 4.7 `events.jsonl`: append-only, escrito solo por el runner, una entrada por transición
+- [x] 4.8 Salida estándar en vivo: una línea por transición, sin volcar la salida cruda de los agentes
 
 ## 5. Checks mecánicos
 
-- [ ] 5.1 Lint del test después de `verify` exit 0: archivo inexistente, sin aserciones, mockea un módulo de su propio `files`, solo aserciones de existencia, snapshot regenerable → `test-lint-failed`
-- [ ] 5.2 Red check dentro del worktree: quitar los `files` no nombrados en `verify`, correr `verify`, restaurar; exit 0 → `red-check-failed`
-- [ ] 5.3 Honrar `red-check: skip` con razón y registrarla para el bloque de riesgo residual
-- [ ] 5.4 Congelar la huella de los archivos de test tras el primer `verify` exit 0 y exigirla idéntica en todo intento posterior (D2)
-- [ ] 5.5 Scope check contra la base de la ola; archivos de más → `out-of-scope` con la lista
-- [ ] 5.6 El runner commitea al pasar `verify`, con trailer de tarea y trailer de requisito (D5)
+- [ ] 5.1 El runner commitea al pasar `verify`, con trailer de tarea y trailer de requisito (D5) — primero: red check y scope check dependen de que el commit ya exista
+- [ ] 5.2 Lint del test después del commit: archivo inexistente, sin aserciones, mockea un módulo de su propio `files`, solo aserciones de existencia, snapshot regenerable → `test-lint-failed`
+- [ ] 5.3 Congelar la huella de los archivos de test tras el primer `verify` exit 0 y exigirla idéntica en todo intento posterior (D2)
+- [ ] 5.4 Red check dentro del worktree: quitar los `files` no nombrados en `verify`, correr `verify`, restaurar desde el commit; exit 0 → `red-check-failed`
+- [ ] 5.5 Honrar `red-check: skip` con razón y registrarla para el bloque de riesgo residual
+- [ ] 5.6 Scope check contra la base de la ola; archivos de más → `out-of-scope` con la lista
 - [ ] 5.7 Test de integración del red check y del congelamiento contra un repo git descartable
 
 ## 6. Checker de ola y barrier
