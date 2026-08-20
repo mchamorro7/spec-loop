@@ -643,6 +643,9 @@ const STATUS_ICON = {
   stuck: "⚠️",
   blocked: "❌",
   "needs-scope": "⚠️",
+  "test-lint-failed": "❌",
+  "red-check-failed": "❌",
+  "out-of-scope": "❌",
 };
 
 /** Render one events.jsonl record as the live stdout line for it. See task 4.8. */
@@ -658,14 +661,103 @@ export function formatEventLine(event) {
     }
     case "needs_scope":
       return `${head}  NEEDS-SCOPE: ${event.note}`;
+    case "commit":
+      return `${head}  commit ${event.sha.slice(0, 7)}`;
+    case "test_lint":
+      return `${head}  test lint ${event.ok ? "ok" : "FAILED"}`;
+    case "freeze":
+      return `${head}  freeze ${event.fingerprint.slice(0, 8)}`;
+    case "red_check":
+      return event.skipped
+        ? `${head}  red-check skip: ${event.reason}`
+        : `${head}  red-check ${event.ok ? "ok" : "FAILED"}`;
+    case "scope_check":
+      return `${head}  scope-check ${event.ok ? "ok" : "FAILED"}`;
     case "closed": {
       const icon = STATUS_ICON[event.status] ?? "";
+      const attempts = typeof event.attempts === "number" ? `  ${event.attempts} attempts` : "";
       const cost = typeof event.cost_usd === "number" ? `  $${event.cost_usd.toFixed(2)}` : "";
-      return `${head}  ${icon} ${event.status}  ${event.attempts} attempts${cost}`;
+      return `${head}  ${icon} ${event.status}${attempts}${cost}`;
     }
     default:
       return `${head}  ${event.event}`;
   }
+}
+
+/** Test files declared among `files` that are also named inside `verify` — the set lint/freeze/red check operate on. */
+export function testFilesFrom(files, verify) {
+  return files.filter((f) => TEST_FILE_RE.test(f) && verify.includes(f));
+}
+
+const ASSERTION_RE = /\bexpect\s*\(|\bassert(?:\.\w+)?\s*\(|\.should\./;
+const WEAK_ASSERTION_PATTERNS = [
+  /\.toBeDefined\s*\(\s*\)/,
+  /\.toBeTruthy\s*\(\s*\)/,
+  /\.toBeFalsy\s*\(\s*\)/,
+  /\.not\.toBeNull\s*\(\s*\)/,
+  /\.not\.toBeUndefined\s*\(\s*\)/,
+  /assert\.ok\s*\(\s*[^,)]+\)/,
+];
+const SNAPSHOT_RE = /\.toMatchSnapshot\s*\(|\.toMatchInlineSnapshot\s*\(/;
+const MOCK_CALL_RE = /\b(?:vi|jest)\.mock\s*\(\s*["'`]([^"'`]+)["'`]/g;
+
+/**
+ * The mechanical half of the lint del test requirement: does this content
+ * look like a test that could catch anything? `ownFiles` are the task's
+ * other declared files (everything but the test file itself), used to
+ * detect a test that mocks the module it's supposed to be exercising.
+ * `content === null` means the file doesn't exist. See task 5.2.
+ */
+export function lintTestContent(content, ownFiles) {
+  if (content === null) return ["el archivo de test no existe"];
+
+  const errors = [];
+  const lines = content.split("\n");
+  const assertionLines = lines.filter((l) => ASSERTION_RE.test(l));
+
+  if (assertionLines.length === 0) {
+    errors.push("el archivo de test no contiene ninguna aserción");
+  } else if (assertionLines.every((l) => WEAK_ASSERTION_PATTERNS.some((re) => re.test(l)))) {
+    errors.push("el archivo de test solo tiene aserciones de mera existencia (toBeDefined/toBeTruthy/assert.ok)");
+  }
+
+  if (SNAPSHOT_RE.test(content)) {
+    errors.push("el archivo de test se apoya en un snapshot regenerable");
+  }
+
+  let m;
+  MOCK_CALL_RE.lastIndex = 0;
+  while ((m = MOCK_CALL_RE.exec(content)) !== null) {
+    const spec = m[1].replace(/^\.\//, "");
+    const mocksOwnFile = ownFiles.some((f) => {
+      const base = f.replace(/\.[A-Za-z0-9]+$/, "");
+      return f.includes(spec) || base.endsWith(spec) || spec.endsWith(base.split("/").pop());
+    });
+    if (mocksOwnFile) {
+      errors.push(`el test mockea "${m[1]}", que está en los files de la propia tarea`);
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * A stable fingerprint over one or more test files' content, keyed by path
+ * so key order never affects the result. This is what the runner compares
+ * across a refutation retry to make sure the loop didn't edit its own
+ * feedback. See task 5.3, D2.
+ */
+export function computeTestFingerprint(fileContentsByPath) {
+  const sortedPaths = Object.keys(fileContentsByPath).sort();
+  const combined = sortedPaths.map((p) => `${p}:${fileContentsByPath[p].length}:${fileContentsByPath[p]}`).join("|");
+  return createHash("sha256").update(combined).digest("hex");
+}
+
+/** Files touched by the diff that aren't covered by any declared path, honoring `/**` ownership. See task 5.6. */
+export function findUndeclaredFiles(touchedFiles, declaredFiles) {
+  return touchedFiles.filter(
+    (f) => !declaredFiles.some((d) => d === f || (d.endsWith("/**") && ownsPath(d, f))),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -725,8 +817,21 @@ function loadRepoConfig() {
   return loadConfig(text, cpus().length);
 }
 
+/**
+ * Every subprocess env, minus Node's own test-runner-internal variables.
+ * Without this, a `verify:` command that itself runs `node --test` (a
+ * common case, and exactly what group 11 does when spec-loop tests itself)
+ * inherits `NODE_TEST_CONTEXT` from whatever `node --test` is running
+ * spec-loop's own suite, and its exit-code semantics silently break.
+ */
+function subprocessEnv() {
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT;
+  return env;
+}
+
 function runShell(command, cwd) {
-  const result = spawnSync(command, { shell: true, cwd, encoding: "utf8" });
+  const result = spawnSync(command, { shell: true, cwd, encoding: "utf8", env: subprocessEnv() });
   return {
     code: result.status ?? 1,
     stdout: result.stdout ?? "",
@@ -777,7 +882,7 @@ function printErrors(errors) {
 }
 
 function runGit(args, cwd) {
-  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  const result = spawnSync("git", args, { cwd, encoding: "utf8", env: subprocessEnv() });
   return { code: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
@@ -843,7 +948,7 @@ function spawnImplementer(prompt, { worktreeDir: cwd, config }) {
       "--output-format",
       "json",
     ],
-    { cwd, encoding: "utf8", timeout: timeoutMs },
+    { cwd, encoding: "utf8", timeout: timeoutMs, env: subprocessEnv() },
   );
 
   let parsed = {};
@@ -960,6 +1065,133 @@ export function runTaskPipeline(task, ctx) {
     });
     return { status: outcome.status, attempts: attempt, worktree };
   }
+}
+
+/**
+ * A task whose `files` is a single `/**` entry owns a whole subtree instead
+ * of naming exact paths, so lint/freeze/red check have nothing to iterate
+ * over until it's expanded into the concrete files the commit actually
+ * touched. The scope check doesn't need this: `findUndeclaredFiles` already
+ * understands `/**` ownership directly.
+ */
+function resolveGlobFiles(task, dir, baseRef) {
+  if (!(task.files.length === 1 && task.files[0].endsWith("/**"))) return task.files;
+  const diff = runGit(["diff", "--name-only", `${baseRef}..HEAD`], dir);
+  return diff.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Remove the task's own implementation (keeping the test files untouched),
+ * run `verify`, then restore the committed state regardless of outcome.
+ * `verify` still failing means the test is exercising real behavior;
+ * `verify` still passing means it isn't. See "Red check".
+ */
+function runRedCheck(task, dir, baseRef, implFiles) {
+  for (const f of implFiles) {
+    const existsInBase = runGit(["cat-file", "-e", `${baseRef}:${f}`], dir).code === 0;
+    if (existsInBase) {
+      runGit(["checkout", baseRef, "--", f], dir);
+    } else {
+      runGit(["rm", "-f", "--ignore-unmatch", "--", f], dir);
+    }
+  }
+  const verifyResult = runShell(task.verify, dir);
+  runGit(["checkout", "HEAD", "--", "."], dir); // restore the full committed state either way
+  return { passed: verifyResult.code !== 0 };
+}
+
+/**
+ * Everything that runs once `verify` has returned exit 0 and the attempt
+ * loop has handed the task over: commit → lint → freeze → red check →
+ * scope check, in that order (design.md D4/D5 — the commit has to exist
+ * before red check can restore from it or scope check can diff against
+ * it). Ends either at a terminal failure (`closed` event) or at
+ * `checks-passed`, handed off to the wave's checker (group 6). See group 5.
+ */
+export function runMechanicalChecks(task, ctx) {
+  const { worktree, baseRef, eventsPath, emit = (e) => process.stdout.write(formatEventLine(e) + "\n") } = ctx;
+  const dir = worktree.dir;
+
+  const record = (event) => {
+    const full = { ts: new Date().toISOString(), task: task.id, ...event };
+    appendEvent(eventsPath, full);
+    emit(full);
+    return full;
+  };
+
+  const dirty = runGit(["status", "--porcelain"], dir).stdout.trim() !== "";
+  if (!dirty) {
+    // verify passed without the implementer changing anything: exactly the
+    // shape of thing red check exists to reject, just caught before there's
+    // even a diff to red-check against.
+    record({ event: "red_check", ok: false, reason: "verify pasó sin ningún cambio respecto de la base" });
+    record({ event: "closed", status: "red-check-failed" });
+    return { status: "red-check-failed", reason: "verify pasó sin ningún cambio respecto de la base" };
+  }
+
+  runGit(["add", "-A"], dir);
+  runGit(
+    [
+      "commit",
+      "-q",
+      "-m",
+      `spec-loop: ${task.id}`,
+      "--trailer",
+      `Spec-Loop-Task: ${task.id}`,
+      "--trailer",
+      `Spec-Loop-Proves: ${task.proves}`,
+    ],
+    dir,
+  );
+  const commitSha = runGit(["rev-parse", "HEAD"], dir).stdout.trim();
+  record({ event: "commit", sha: commitSha });
+
+  const resolvedFiles = resolveGlobFiles(task, dir, baseRef);
+  const testFiles = testFilesFrom(resolvedFiles, task.verify);
+  const implFiles = resolvedFiles.filter((f) => !testFiles.includes(f));
+
+  const lintErrors = [];
+  for (const f of testFiles) {
+    const full = join(dir, f);
+    const content = existsSync(full) ? readFileSync(full, "utf8") : null;
+    const ownFiles = resolvedFiles.filter((x) => x !== f);
+    lintErrors.push(...lintTestContent(content, ownFiles).map((e) => `${f}: ${e}`));
+  }
+  record({ event: "test_lint", ok: lintErrors.length === 0, errors: lintErrors });
+  if (lintErrors.length > 0) {
+    record({ event: "closed", status: "test-lint-failed" });
+    return { status: "test-lint-failed", errors: lintErrors };
+  }
+
+  const contentsByPath = {};
+  for (const f of testFiles) contentsByPath[f] = readFileSync(join(dir, f), "utf8");
+  const fingerprint = computeTestFingerprint(contentsByPath);
+  record({ event: "freeze", fingerprint });
+
+  if (task.redCheck.mode === "skip") {
+    record({ event: "red_check", skipped: true, reason: task.redCheck.reason });
+  } else {
+    const redResult = runRedCheck(task, dir, baseRef, implFiles);
+    record({ event: "red_check", ok: redResult.passed });
+    if (!redResult.passed) {
+      record({ event: "closed", status: "red-check-failed" });
+      return { status: "red-check-failed" };
+    }
+  }
+
+  const diffResult = runGit(["diff", "--name-only", `${baseRef}..HEAD`], dir);
+  const touched = diffResult.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+  const extraFiles = findUndeclaredFiles(touched, task.files);
+  record({ event: "scope_check", ok: extraFiles.length === 0, extra: extraFiles });
+  if (extraFiles.length > 0) {
+    record({ event: "closed", status: "out-of-scope" });
+    return { status: "out-of-scope", extraFiles };
+  }
+
+  return { status: "checks-passed", commitSha, testFingerprint: fingerprint };
 }
 
 /** `spec-loop` — preflight, print the waves, exit. Costs zero tokens. */

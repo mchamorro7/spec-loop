@@ -37,13 +37,13 @@
 
 ## 5. Checks mecánicos
 
-- [ ] 5.1 El runner commitea al pasar `verify`, con trailer de tarea y trailer de requisito (D5) — primero: red check y scope check dependen de que el commit ya exista
-- [ ] 5.2 Lint del test después del commit: archivo inexistente, sin aserciones, mockea un módulo de su propio `files`, solo aserciones de existencia, snapshot regenerable → `test-lint-failed`
-- [ ] 5.3 Congelar la huella de los archivos de test tras el primer `verify` exit 0 y exigirla idéntica en todo intento posterior (D2)
-- [ ] 5.4 Red check dentro del worktree: quitar los `files` no nombrados en `verify`, correr `verify`, restaurar desde el commit; exit 0 → `red-check-failed`
-- [ ] 5.5 Honrar `red-check: skip` con razón y registrarla para el bloque de riesgo residual
-- [ ] 5.6 Scope check contra la base de la ola; archivos de más → `out-of-scope` con la lista
-- [ ] 5.7 Test de integración del red check y del congelamiento contra un repo git descartable
+- [x] 5.1 El runner commitea al pasar `verify`, con trailer de tarea y trailer de requisito (D5) — primero: red check y scope check dependen de que el commit ya exista
+- [x] 5.2 Lint del test después del commit: archivo inexistente, sin aserciones, mockea un módulo de su propio `files`, solo aserciones de existencia, snapshot regenerable → `test-lint-failed`
+- [x] 5.3 Congelar la huella de los archivos de test tras el primer `verify` exit 0 y exigirla idéntica en todo intento posterior (D2)
+- [x] 5.4 Red check dentro del worktree: quitar los `files` no nombrados en `verify`, correr `verify`, restaurar desde el commit; exit 0 → `red-check-failed`
+- [x] 5.5 Honrar `red-check: skip` con razón y registrarla para el bloque de riesgo residual
+- [x] 5.6 Scope check contra la base de la ola; archivos de más → `out-of-scope` con la lista
+- [x] 5.7 Test de integración del red check y del congelamiento contra un repo git descartable
 
 ## 6. Checker de ola y barrier
 
