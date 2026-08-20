@@ -7,16 +7,16 @@
 
 ## 2. Núcleo puro y sus tests
 
-- [ ] 2.1 `config()`: leer `spec-loop.yaml`, exigir `gate`, `test` y `max-spend`, aplicar defaults de `jobs`, `max-attempts`, `timeout` y `model`; abortar nombrando la clave faltante
-- [ ] 2.2 `parse()`: `tasks.md` → lista de tareas; identificador desde la línea de checkbox, un bloque `yaml` por tarea, prosa hasta la tarea siguiente; rechazar campo desconocido, `id` dentro del bloque, bloque ausente o duplicado, indicando línea (D14)
-- [ ] 2.3 `resolve()`: change actual desde el orden de `roadmap.md`; fallback a change activo único; mensajes distintos para "nada que correr" y ambigüedad irresoluble
-- [ ] 2.4 `preflight()`: las nueve reglas verificables del contrato, incluida la validación de `proves` contra el spec delta; devolver todos los errores, no el primero
-- [ ] 2.5 `waves()`: particionado greedy, estable y **sin estado mutable**; detectar ola vacía y distinguir ciclo en `needs` de contención total
-- [ ] 2.6 `signature()`: normalizar stderr a una firma estable (primera línea de error, sin números de línea/columna ni rutas absolutas)
-- [ ] 2.7 Tests de `parse` con fixtures buenos y rotos, uno por modo de fallo
-- [ ] 2.8 Tests de `preflight`, uno por regla
-- [ ] 2.9 Tests de `waves` en tabla: disjuntas, contención, `needs`, ciclo, corte por capa
-- [ ] 2.10 Tests de `resolve` y de `signature`
+- [x] 2.1 `config()`: leer `spec-loop.yaml`, exigir `gate`, `test` y `max-spend`, aplicar defaults de `jobs`, `max-attempts`, `timeout` y `model`; abortar nombrando la clave faltante
+- [x] 2.2 `parse()`: `tasks.md` → lista de tareas; identificador desde la línea de checkbox, un bloque `yaml` por tarea, prosa hasta la tarea siguiente; rechazar campo desconocido, `id` dentro del bloque, bloque ausente o duplicado, indicando línea (D14)
+- [x] 2.3 `resolve()`: change actual desde el orden de `roadmap.md`; fallback a change activo único; mensajes distintos para "nada que correr" y ambigüedad irresoluble
+- [x] 2.4 `preflight()`: las ocho reglas verificables del contrato, incluida la validación de `proves` contra el spec delta; devolver todos los errores, no el primero
+- [x] 2.5 `waves()`: particionado greedy, estable y **sin estado mutable**; detectar ola vacía y distinguir ciclo en `needs` de contención total
+- [x] 2.6 `signature()`: normalizar stderr a una firma estable (primera línea de error, sin números de línea/columna ni rutas absolutas)
+- [x] 2.7 Tests de `parse` con fixtures buenos y rotos, uno por modo de fallo
+- [x] 2.8 Tests de `preflight`, uno por regla
+- [x] 2.9 Tests de `waves` en tabla: disjuntas, contención, `needs`, ciclo, corte por capa
+- [x] 2.10 Tests de `resolve` y de `signature`
 
 ## 3. Invocación pelada
 
@@ -72,7 +72,7 @@
 
 ## 9. Skills de planificación
 
-- [ ] 9.1 `skills/task-contract/SKILL.md`: la gramática extendida sobre el formato de OpenSpec, los cinco campos, las nueve reglas verificables y las cuatro de composición, más el recetario de `verify` por forma de tarea y los olores con su cazador
+- [ ] 9.1 `skills/task-contract/SKILL.md`: la gramática extendida sobre el formato de OpenSpec, los cinco campos, las ocho reglas verificables y las cuatro de composición, más el recetario de `verify` por forma de tarea y los olores con su cazador
 - [ ] 9.2 `skills/roadmap/SKILL.md`: divergir, pausa de recorte, riesgos que matan el proyecto, walking skeleton, corte en changes por riesgo, triage de NFR, y `roadmap.md` con lo recortado adentro
 - [ ] 9.3 `skills/propose/SKILL.md`: brainstorm con pausa de camino, resolución de supuestos por las tres puertas, pausa condicional de arquitectura, derivación del `verify` desde el spec delta, descomposición con ola 0, y cierre corriendo la invocación pelada del runner
 - [ ] 9.4 Verificar que `propose` no pueda cerrar con un supuesto sin resolver ni con un NFR de juicio convertido en tarea

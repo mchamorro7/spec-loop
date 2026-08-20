@@ -80,14 +80,18 @@ El runner SHALL rechazar `tasks.md` antes de spawnear ningún agente cuando se v
 de estas reglas:
 
 1. `verify` no empieza con el comando de gate configurado.
-2. Un archivo que la tarea escribe no está declarado en `files`.
-3. Los archivos de test de la tarea no aparecen nombrados dentro de `verify`.
-4. `red-check: skip` no lleva razón escrita.
-5. El change declara más de quince tareas.
-6. Existe un ciclo en `needs`.
-7. Un identificador de checkbox está duplicado.
-8. Un `needs` referencia un identificador inexistente.
-9. `proves` no referencia un requisito presente en el spec delta del change.
+2. Los archivos de test de la tarea no aparecen nombrados dentro de `verify`.
+3. `red-check: skip` no lleva razón escrita.
+4. El change declara más de quince tareas.
+5. Existe un ciclo en `needs`.
+6. Un identificador de checkbox está duplicado.
+7. Un `needs` referencia un identificador inexistente.
+8. `proves` no referencia un requisito presente en el spec delta del change.
+
+Que un archivo escrito por la tarea no esté declarado en `files` SHALL NO ser una regla de
+preflight: no hay código todavía, así que es inverificable antes de spawnear. Esa regla SHALL
+verificarse en tiempo de ejecución mediante el scope check, contra el diff real de la rama de la
+tarea.
 
 #### Scenario: `verify` sin el gate
 

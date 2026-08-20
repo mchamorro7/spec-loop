@@ -61,7 +61,7 @@ ser el actual.
 ### Requirement: Preflight antes de spawnear
 
 El runner SHALL, antes de crear ningún worktree o spawnear ningún agente: verificar que el gate
-pasa en la base, parsear `tasks.md`, validar las nueve reglas verificables, particionar en olas
+pasa en la base, parsear `tasks.md`, validar las ocho reglas verificables, particionar en olas
 y limpiar los worktrees viejos del change. Cualquier fallo SHALL abortar el run identificando la
 causa.
 
