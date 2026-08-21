@@ -96,3 +96,17 @@ test("waves: dotted ids order numerically, not lexically (2.10 after 2.2)", () =
   assert.deepEqual(ids(waves[0]), ["2.2"]);
   assert.deepEqual(ids(waves[1]), ["2.10"]);
 });
+
+test("waves: preSatisfiedIds unblocks a need pointing at an already-merged earlier task", () => {
+  const { waves, errors } = planWaves([task("2.1", ["b.ts"], ["1.1"])], ["1.1"]);
+  assert.deepEqual(errors, []);
+  assert.equal(waves.length, 1);
+  assert.deepEqual(ids(waves[0]), ["2.1"]);
+});
+
+test("waves: without preSatisfiedIds, the same task is a dangling reference, not a false cycle", () => {
+  const { waves, errors } = planWaves([task("2.1", ["b.ts"], ["1.1"])]);
+  assert.equal(waves, null);
+  assert.match(errors[0], /1\.1/);
+  assert.doesNotMatch(errors[0], /ciclo/);
+});

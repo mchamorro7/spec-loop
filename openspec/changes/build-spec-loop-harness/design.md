@@ -236,6 +236,36 @@ marcando checkboxes nunca se confunde con un cambio de plan.
 Los skills de planificación no dependen del runner, solo del formato que fija el paso 1, así que
 se pueden escribir en paralelo a todo esto.
 
+### D15 · `checker-model`: diversidad de modelo, opt-in
+
+v3.1 traía `--verifier-model` con el mismo argumento: *"la evidencia dice que el verifier gain
+cae cuando solver y verifier son de la misma familia — los modelos aceptan soluciones que se
+parecen a su propio razonamiento."* Al simplificar a cero flags el campo se perdió en el
+camino, sin una decisión explícita que lo descartara — quedó afuera por omisión, no por análisis.
+
+Una revisión honesta de [garrytan/gstack](https://github.com/garrytan/gstack) — plataforma
+open-source de 214k líneas, sin relación con este proyecto — encontró que resolvió el mismo
+problema por su cuenta: `/codex` pide una segunda opinión de un modelo distinto sobre el mismo
+diff. Es validación independiente de una idea que ya estaba en el diseño original, no una idea
+nueva importada de afuera.
+
+**Decisión:** `checker-model`, clave opcional en `spec-loop.yaml`, default = valor de `model`.
+Con el default, el checker corre en el mismo modelo que el implementer — cero diferencia de
+comportamiento contra lo que ya existía. Declararla distinta es la única palanca disponible
+contra la pregunta (b) del checker (*"¿la aserción prueba el requisito o solo reimplementa el
+código?"*), que es la única superficie del harness que sigue siendo juicio.
+
+**Por qué opt-in y no default-distinto:** cambiar el default habría sido una decisión de
+producto no pedida — un modelo más caro corriendo por default en cada ola sin que nadie lo haya
+elegido. Con el default en `model`, el usuario paga la diversidad solo cuando decide que la
+pregunta (b) le importa lo suficiente.
+
+**Por qué esto no contradice el resto del diseño:** gstack resuelve la MISMA pregunta con MÁS
+peso en juicio de agente (heurísticas de atribución de fallos, coverage auto-evaluado, gates que
+el mismo agente marca). Este harness la resuelve con MENOS: siete de sus ocho capas de
+verificación ya son deterministas: `checker-model` refuerza la única que no lo es, en vez de
+agregar una capa de juicio nueva.
+
 ## Risks / Trade-offs
 
 | Riesgo | Trade-off aceptado |

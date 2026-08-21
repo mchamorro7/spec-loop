@@ -128,6 +128,12 @@ separado.
 Una tarea refutada SHALL disparar como máximo una re-implementación, y el verifier SHALL correr
 como máximo dos veces por ola, siempre dentro del tope total de intentos de cada tarea.
 
+El checker SHALL correr bajo el modelo configurado en `checker-model`, que por default coincide
+con el del implementer y que el usuario puede separar sin tocar código. Un checker que comparte
+familia de modelo con quien escribió el código tiende a aceptar soluciones que se parecen a su
+propio razonamiento; declarar `checker-model` distinto es la única mitigación disponible para la
+pregunta (b), la única superficie del harness que sigue siendo juicio y no un exit code.
+
 #### Scenario: Una ola de cinco
 
 - **WHEN** cinco tareas de una ola pasan los checks deterministas
@@ -154,6 +160,12 @@ como máximo dos veces por ola, siempre dentro del tope total de intentos de cad
   violación de una decisión de arquitectura registrada
 - **THEN** el checker la detecta sobre el diff acumulado, aunque ningún implementer aislado en su
   worktree pudiera verla
+
+#### Scenario: Diversidad de modelo por default
+
+- **WHEN** el proyecto no declara `checker-model`
+- **THEN** el checker corre con el mismo modelo que `model`, y el usuario puede separarlos
+  declarando `checker-model` sin tocar código
 
 ### Requirement: El trinquete — una violación se convierte en regla
 

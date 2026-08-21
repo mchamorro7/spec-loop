@@ -15,7 +15,25 @@ test("loadConfig: accepts the three required keys and fills defaults", () => {
   assert.equal(config.maxAttempts, 3);
   assert.equal(config.timeout, "20m");
   assert.equal(config.model, "sonnet");
+  assert.equal(config.checkerModel, "sonnet"); // D15: defaults to `model`, unconfigured behaves as before
   assert.equal(config.barrier, null);
+});
+
+test("loadConfig: checker-model defaults to model, not to a hardcoded value", () => {
+  const { config } = loadConfig(
+    `gate: "g"\ntest: "t"\nmax-spend: 1\nmodel: "haiku"\n`,
+    4,
+  );
+  assert.equal(config.checkerModel, "haiku");
+});
+
+test("loadConfig: checker-model can be set independently of model", () => {
+  const { config } = loadConfig(
+    `gate: "g"\ntest: "t"\nmax-spend: 1\nmodel: "sonnet"\nchecker-model: "opus"\n`,
+    4,
+  );
+  assert.equal(config.model, "sonnet");
+  assert.equal(config.checkerModel, "opus");
 });
 
 test("loadConfig: honors an explicit jobs override instead of the cpu default", () => {

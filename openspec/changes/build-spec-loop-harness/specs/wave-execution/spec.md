@@ -16,9 +16,10 @@ posicionales ni flags:
 - `spec-loop status` — imprime el estado derivado del registro de eventos.
 
 Toda la configuración SHALL vivir en `spec-loop.yaml` en la raíz del repo, con tres claves
-obligatorias (`gate`, `test`, `max-spend`), cuatro opcionales con default (`jobs`,
-`max-attempts`, `timeout`, `model`) y una opcional sin default (`barrier`, el comando de chequeo
-caro).
+obligatorias (`gate`, `test`, `max-spend`), cinco opcionales con default (`jobs`,
+`max-attempts`, `timeout`, `model`, `checker-model`) y una opcional sin default (`barrier`, el
+comando de chequeo caro). `checker-model` SHALL usar el valor de `model` como default cuando no
+se declare.
 
 #### Scenario: Invocación pelada
 

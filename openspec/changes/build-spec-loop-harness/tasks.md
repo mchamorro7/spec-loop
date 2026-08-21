@@ -47,11 +47,12 @@
 
 ## 6. Checker de ola y barrier
 
-- [ ] 6.1 Spawn del checker una vez por ola, de solo lectura, sin permiso de exploración, con los N diffs, el spec delta y `architecture.md` entregados por entrada; veredicto estructurado por tarea y regla de linter propuesta cuando la violación sea mecanizable
-- [ ] 6.2 Refutación → una re-implementación por tarea refutada, en paralelo, dentro del tope total de intentos; máximo dos pasadas de checker por ola
-- [ ] 6.3 Barrier: merge de las verificadas en orden de `id`; conflicto → detener el change y reportarlo como bug del harness
-- [ ] 6.4 Suite del proyecto sobre la rama del change, siempre con concurrencia 1; roja → detener el change sin revertir nada. Después, correr el comando de chequeo caro si está declarado, con la misma política
-- [ ] 6.5 Propagar bloqueo por clausura de `needs` sobre tareas rojas y recalcular las olas restantes
+- [x] 6.0 Agregar `checker-model` a `loadConfig()`: opcional, default = `model` (D15)
+- [x] 6.1 Spawn del checker una vez por ola bajo `checker-model`, de solo lectura, sin permiso de exploración, con los N diffs, el spec delta y `architecture.md` entregados por entrada; veredicto estructurado por tarea y regla de linter propuesta cuando la violación sea mecanizable
+- [x] 6.2 Refutación → una re-implementación por tarea refutada, en paralelo, dentro del tope total de intentos; máximo dos pasadas de checker por ola
+- [x] 6.3 Barrier: merge de las verificadas en orden de `id`; conflicto → detener el change y reportarlo como bug del harness
+- [x] 6.4 Suite del proyecto sobre la rama del change, siempre con concurrencia 1; roja → detener el change sin revertir nada. Después, correr el comando de chequeo caro si está declarado, con la misma política
+- [x] 6.5 Propagar bloqueo por clausura de `needs` sobre tareas rojas y recalcular las olas restantes
 - [ ] 6.6 Habilitar concurrencia mayor a 1 con un pool del tamaño de `jobs`
 
 ## 7. Estado, reporte y salida
@@ -79,7 +80,7 @@
 
 ## 10. Templates, manifiesto y documentación
 
-- [ ] 10.1 `templates/spec-loop.yaml` con las tres claves obligatorias, las cuatro opcionales con default y `barrier` comentada
+- [ ] 10.1 `templates/spec-loop.yaml` con las tres claves obligatorias, las cinco opcionales con default y `barrier` comentada
 - [ ] 10.2 `templates/CLAUDE.md` bajo cien líneas, solo restricciones de juicio; lo chequeable va al gate
 - [ ] 10.3 `templates/settings.json` con permisos y modelo
 - [ ] 10.4 `.claude-plugin/plugin.json`

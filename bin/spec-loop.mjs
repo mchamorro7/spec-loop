@@ -80,6 +80,13 @@ export function loadConfig(configText, availableCpus = 4) {
     errors.push(`"model" debe ser un string no vacío`);
   }
 
+  // D15: opt-in model diversity for the checker. Defaults to `model`, so an
+  // unconfigured repo behaves exactly as it did before this key existed.
+  const checkerModel = doc["checker-model"] ?? model;
+  if (typeof checkerModel !== "string" || checkerModel === "") {
+    errors.push(`"checker-model" debe ser un string no vacío`);
+  }
+
   const barrier = doc.barrier ?? null;
   if (barrier !== null && (typeof barrier !== "string" || barrier === "")) {
     errors.push(`"barrier" debe ser un string no vacío cuando está declarado`);
@@ -88,7 +95,7 @@ export function loadConfig(configText, availableCpus = 4) {
   if (errors.length > 0) return { config: null, errors };
 
   return {
-    config: { gate, test, maxSpend, jobs, maxAttempts, timeout, model, barrier },
+    config: { gate, test, maxSpend, jobs, maxAttempts, timeout, model, checkerModel, barrier },
     errors: [],
   };
 }
@@ -397,11 +404,18 @@ function filesIntersect(a, b) {
   return false;
 }
 
-/** Partition tasks into disjoint, dependency-respecting waves. Pure: no mutable state in or out. See task 2.5. */
-export function planWaves(tasks) {
+/**
+ * Partition tasks into disjoint, dependency-respecting waves. Pure: no
+ * mutable state in or out. `preSatisfiedIds` seeds already-closed ids from
+ * waves that ran in an earlier call — without it, recalculating the
+ * remaining waves after a barrier (task 6.5) would treat a need pointing at
+ * an already-merged earlier task as a dangling reference. See task 2.5.
+ */
+export function planWaves(tasks, preSatisfiedIds = []) {
   const sorted = [...tasks].sort((a, b) => compareIds(a.id, b.id));
-  const allIds = new Set(sorted.map((t) => t.id));
-  const closedIds = new Set();
+  const preSatisfied = new Set(preSatisfiedIds);
+  const allIds = new Set([...sorted.map((t) => t.id), ...preSatisfied]);
+  const closedIds = new Set(preSatisfied);
   let remaining = sorted;
   const waves = [];
 
@@ -648,10 +662,15 @@ const STATUS_ICON = {
   "out-of-scope": "❌",
 };
 
-/** Render one events.jsonl record as the live stdout line for it. See task 4.8. */
+/**
+ * Render one events.jsonl record as the live stdout line for it. Most
+ * events belong to one task; a few (merge, suite, barrier_check) are
+ * wave/change-level and carry no `task`, so the head falls back to just the
+ * timestamp instead of printing "undefined". See task 4.8.
+ */
 export function formatEventLine(event) {
   const time = new Date(event.ts).toISOString().slice(11, 19);
-  const head = `${time}  ${event.task}`;
+  const head = event.task ? `${time}  ${event.task}` : time;
   switch (event.event) {
     case "attempt_start":
       return `${head}  attempt ${event.attempt}`;
@@ -667,12 +686,22 @@ export function formatEventLine(event) {
       return `${head}  test lint ${event.ok ? "ok" : "FAILED"}`;
     case "freeze":
       return `${head}  freeze ${event.fingerprint.slice(0, 8)}`;
+    case "freeze_check":
+      return `${head}  freeze check ${event.ok ? "ok" : "FAILED (test file changed)"}`;
     case "red_check":
       return event.skipped
         ? `${head}  red-check skip: ${event.reason}`
         : `${head}  red-check ${event.ok ? "ok" : "FAILED"}`;
     case "scope_check":
       return `${head}  scope-check ${event.ok ? "ok" : "FAILED"}`;
+    case "checker_verdict":
+      return `${head}  checker ${event.id}: ${event.refuted ? "REFUTED" : "ok"}${event.missing ? " (sin veredicto)" : ""}`;
+    case "merge":
+      return `${head}  merge ${event.ok ? "ok" : `FAILED (${event.failedTask})`}`;
+    case "suite":
+      return `${head}  suite ${event.ok ? "ok" : "FAILED"}`;
+    case "barrier_check":
+      return `${head}  barrier check ${event.ok ? "ok" : "FAILED"}`;
     case "closed": {
       const icon = STATUS_ICON[event.status] ?? "";
       const attempts = typeof event.attempts === "number" ? `  ${event.attempts} attempts` : "";
@@ -758,6 +787,87 @@ export function findUndeclaredFiles(touchedFiles, declaredFiles) {
   return touchedFiles.filter(
     (f) => !declaredFiles.some((d) => d === f || (d.endsWith("/**") && ownsPath(d, f))),
   );
+}
+
+/**
+ * What the checker receives as its `-p` prompt. The diffs themselves go in
+ * separately, over stdin (see "El diff se entrega, no se busca") — this is
+ * everything else it needs to answer its four questions: the spec delta,
+ * the registered architecture decisions, and which task claims which
+ * `proves`, so it can tell an implementation from something adjacent to it.
+ */
+export function buildCheckerPrompt(waveTasks, specDeltaText, architectureText) {
+  const lines = ["## Spec delta", specDeltaText?.trim() || "(vacío)", ""];
+  lines.push("## Decisiones de arquitectura registradas");
+  lines.push(architectureText?.trim() || "(vacío — todavía no hay decisiones tomadas)");
+  lines.push("", "## Tareas de esta ola (id -> proves)");
+  for (const t of waveTasks) lines.push(`- ${t.id}: ${t.proves}`);
+  return lines.join("\n");
+}
+
+/**
+ * Validate the checker's raw output against "Evidencia obligatoria": a
+ * `refuted: true` with no evidence doesn't count as a founded refutation —
+ * downgraded to non-refuting, but the reason is kept so the report can still
+ * show it. A task the checker said nothing about is treated as not refuted
+ * (a malformed/incomplete verdict shouldn't block a merge on its own) but
+ * flagged `missing` so that's visible rather than silently assumed clean.
+ */
+export function validateCheckerVerdicts(rawVerdicts, waveTaskIds) {
+  const byId = new Map();
+  for (const v of rawVerdicts ?? []) {
+    if (!v || typeof v.id !== "string" || !waveTaskIds.includes(v.id)) continue;
+    const hasEvidence = typeof v.evidence === "string" && v.evidence.trim() !== "";
+    byId.set(v.id, {
+      id: v.id,
+      refuted: v.refuted === true && hasEvidence,
+      unfoundedRefutation: v.refuted === true && !hasEvidence,
+      reason: typeof v.reason === "string" ? v.reason : "",
+      evidence: hasEvidence ? v.evidence : null,
+      rule: v.rule && typeof v.rule === "object" ? v.rule : null,
+      missing: false,
+    });
+  }
+  return waveTaskIds.map(
+    (id) =>
+      byId.get(id) ?? {
+        id,
+        refuted: false,
+        unfoundedRefutation: false,
+        reason: "sin veredicto del checker",
+        evidence: null,
+        rule: null,
+        missing: true,
+      },
+  );
+}
+
+/**
+ * After a wave closes with some tasks red, mark every remaining task whose
+ * `needs` closure touches one of them as blocked-by-dep (transitively — a
+ * task blocked by a red id can itself block others), then re-partition
+ * whatever's left. Pure: the caller supplies the full remaining task list,
+ * the red ids, and which ids from earlier waves already merged. See task 6.5.
+ */
+export function propagateBlockedByDep(remainingTasks, redIds, mergedIds = []) {
+  const red = new Set(redIds);
+  const blocked = new Set();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const t of remainingTasks) {
+      if (blocked.has(t.id)) continue;
+      if (t.needs.some((n) => red.has(n) || blocked.has(n))) {
+        blocked.add(t.id);
+        changed = true;
+      }
+    }
+  }
+
+  const blockedByDep = remainingTasks.filter((t) => blocked.has(t.id));
+  const stillEligible = remainingTasks.filter((t) => !blocked.has(t.id));
+  const { waves, errors } = planWaves(stillEligible, mergedIds);
+  return { blockedByDep, waves: waves ?? [], errors };
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +1024,46 @@ function ensureWorktree(changeName, taskId, baseRef, repoRoot = REPO_ROOT) {
     throw new Error(`no se pudo crear el worktree de "${taskId}": ${add.stderr || add.stdout}`);
   }
   return { dir, branch };
+}
+
+function changeWorktreeDir(repoRoot) {
+  return join(repoRoot, ".spec-loop", "wt", "_change");
+}
+
+// A separate prefix from task branches (`spec-loop/<change>/<id>`) on
+// purpose: git's ref namespace is hierarchical, so a branch literally named
+// `spec-loop/<change>` cannot coexist with `spec-loop/<change>/<id>` --
+// one would have to be both a leaf and a directory in the same tree.
+function changeBranchName(changeName) {
+  return `spec-loop-change/${changeName}`;
+}
+
+/**
+ * The change's own integration branch and worktree — where the barrier
+ * merges verified tasks and runs the suite. It lives apart from whatever
+ * the user has checked out in the main repo, so the barrier never touches
+ * their working directory. Idempotent: a second call (resume) reuses what's
+ * already there instead of recreating it.
+ */
+export function ensureChangeWorktree(changeName, repoRoot = REPO_ROOT) {
+  const dir = changeWorktreeDir(repoRoot);
+  const branch = changeBranchName(changeName);
+
+  if (existsSync(dir)) return { dir, branch };
+
+  const branchExists = runGit(["rev-parse", "--verify", branch], repoRoot).code === 0;
+  const add = branchExists
+    ? runGit(["worktree", "add", dir, branch], repoRoot)
+    : runGit(["worktree", "add", "-b", branch, dir, "HEAD"], repoRoot);
+  if (add.code !== 0) {
+    throw new Error(`no se pudo crear el worktree del change "${changeName}": ${add.stderr || add.stdout}`);
+  }
+  return { dir, branch };
+}
+
+/** The wave's base: the change branch's current HEAD, re-read at the start of every wave (D6). */
+export function currentWaveBase(changeWorktreeInfo) {
+  return runGit(["rev-parse", "HEAD"], changeWorktreeInfo.dir).stdout.trim();
 }
 
 const ALLOWED_IMPLEMENTER_TOOLS =
@@ -1112,7 +1262,13 @@ function runRedCheck(task, dir, baseRef, implFiles) {
  * `checks-passed`, handed off to the wave's checker (group 6). See group 5.
  */
 export function runMechanicalChecks(task, ctx) {
-  const { worktree, baseRef, eventsPath, emit = (e) => process.stdout.write(formatEventLine(e) + "\n") } = ctx;
+  const {
+    worktree,
+    baseRef,
+    eventsPath,
+    expectedTestFingerprint = null,
+    emit = (e) => process.stdout.write(formatEventLine(e) + "\n"),
+  } = ctx;
   const dir = worktree.dir;
 
   const record = (event) => {
@@ -1153,6 +1309,26 @@ export function runMechanicalChecks(task, ctx) {
   const testFiles = testFilesFrom(resolvedFiles, task.verify);
   const implFiles = resolvedFiles.filter((f) => !testFiles.includes(f));
 
+  // D2: the loop cannot edit its own feedback. On a refutation retry (the
+  // only time expectedTestFingerprint is set), the test file(s) must be
+  // byte-identical to what they were the first time verify passed -- checked
+  // before lint, because a changed test makes this task out-of-scope
+  // outright, not a lint problem.
+  if (expectedTestFingerprint !== null) {
+    const currentContents = {};
+    for (const f of testFiles) {
+      const full = join(dir, f);
+      currentContents[f] = existsSync(full) ? readFileSync(full, "utf8") : "";
+    }
+    const currentFingerprint = computeTestFingerprint(currentContents);
+    const unchanged = currentFingerprint === expectedTestFingerprint;
+    record({ event: "freeze_check", ok: unchanged });
+    if (!unchanged) {
+      record({ event: "closed", status: "out-of-scope" });
+      return { status: "out-of-scope", reason: "el archivo de test cambió respecto de la huella congelada" };
+    }
+  }
+
   const lintErrors = [];
   for (const f of testFiles) {
     const full = join(dir, f);
@@ -1192,6 +1368,337 @@ export function runMechanicalChecks(task, ctx) {
   }
 
   return { status: "checks-passed", commitSha, testFingerprint: fingerprint };
+}
+
+const VERIFIER_MD_PATH = join(REPO_ROOT, "agents", "verifier.md");
+const DEFAULT_CHECKER_MAX_TURNS = "10";
+// "Sin permiso de exploración": the checker gets no tools at all. It reasons
+// over what it's handed (diffs via stdin, spec delta + architecture.md in
+// the prompt) and nothing else -- there is nothing for it to go looking for.
+const ALLOWED_CHECKER_TOOLS = "";
+
+const CHECKER_JSON_SCHEMA = JSON.stringify({
+  type: "object",
+  properties: {
+    verdicts: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string" },
+          refuted: { type: "boolean" },
+          reason: { type: "string" },
+          evidence: { type: "string" },
+          rule: {
+            type: "object",
+            properties: {
+              file: { type: "string" },
+              ruleSource: { type: "string" },
+              rationale: { type: "string" },
+            },
+          },
+        },
+        required: ["id", "refuted", "reason", "evidence"],
+      },
+    },
+  },
+  required: ["verdicts"],
+});
+
+/**
+ * Production checker spawn: read-only, fresh context, the wave's diffs
+ * delivered over stdin rather than fetched, structured output validated
+ * against a schema so the verdict is data, never prose to interpret.
+ * Swappable via ctx for testing, exactly like spawnImplementer.
+ */
+function spawnChecker(promptText, diffText, checkerModel, repoRoot = REPO_ROOT) {
+  const result = spawnSync(
+    "claude",
+    [
+      "-p",
+      promptText,
+      "--append-system-prompt-file",
+      VERIFIER_MD_PATH,
+      "--model",
+      checkerModel,
+      "--max-turns",
+      DEFAULT_CHECKER_MAX_TURNS,
+      "--strict-mcp-config",
+      "--allowedTools",
+      ALLOWED_CHECKER_TOOLS,
+      "--output-format",
+      "json",
+      "--json-schema",
+      CHECKER_JSON_SCHEMA,
+    ],
+    { cwd: repoRoot, input: diffText, encoding: "utf8", env: subprocessEnv() },
+  );
+
+  let parsed = {};
+  try {
+    parsed = JSON.parse(result.stdout ?? "");
+  } catch {
+    parsed = {};
+  }
+  const structured = parsed.structured_output ?? parsed;
+  return {
+    verdicts: Array.isArray(structured?.verdicts) ? structured.verdicts : [],
+    costUsd: typeof parsed.total_cost_usd === "number" ? parsed.total_cost_usd : 0,
+  };
+}
+
+/** One task's diff against the wave's base, labeled for the checker's combined stdin. */
+function taskDiffBlock(task, worktreeDir, baseRef) {
+  const diff = runGit(["diff", `${baseRef}..HEAD`], worktreeDir).stdout;
+  return `=== ${task.id} ===\n${diff}`;
+}
+
+/**
+ * One checker spawn over N tasks' diffs together (never one spawn per
+ * task) -- the pregunta (c)/(d) about cross-task supuestos and
+ * architecture violations only make sense read this way. See task 6.1.
+ */
+function runCheckerPass(candidates, ctx) {
+  const { baseRef, specDeltaText, architectureText, config, eventsPath, spawnChecker: spawnFn = spawnChecker, emit = (e) => process.stdout.write(formatEventLine(e) + "\n") } = ctx;
+
+  const tasks = candidates.map((c) => c.task);
+  const promptText = buildCheckerPrompt(tasks, specDeltaText, architectureText);
+  const diffText = candidates.map((c) => taskDiffBlock(c.task, c.worktree.dir, baseRef)).join("\n\n");
+
+  const { verdicts: raw, costUsd } = spawnFn(promptText, diffText, config.checkerModel);
+  const verdicts = validateCheckerVerdicts(raw, tasks.map((t) => t.id));
+
+  for (const v of verdicts) {
+    const full = { ts: new Date().toISOString(), event: "checker_verdict", ...v };
+    appendEvent(eventsPath, full);
+    emit(full);
+  }
+
+  return { verdicts, costUsd };
+}
+
+/**
+ * The one re-implementation a refuted task gets: one more spawn in the same
+ * worktree (never a fresh one -- the accepted commit stays), one more
+ * `verify`, then the mechanical checks again with the frozen fingerprint
+ * enforced so the retry can't quietly weaken its own test. Counts against
+ * the task's total attempt budget; if none is left, it's blocked outright.
+ */
+function runRefutationRetry(task, ctx) {
+  const {
+    worktree,
+    baseRef,
+    config,
+    eventsPath,
+    attemptsUsed,
+    refutedReason,
+    testFingerprint,
+    spawnImplementer: spawnFn = spawnImplementer,
+    emit = (e) => process.stdout.write(formatEventLine(e) + "\n"),
+  } = ctx;
+
+  const record = (event) => {
+    const full = { ts: new Date().toISOString(), task: task.id, ...event };
+    appendEvent(eventsPath, full);
+    emit(full);
+    return full;
+  };
+
+  if (attemptsUsed >= config.maxAttempts) {
+    record({ event: "closed", status: "blocked", attempts: attemptsUsed, reason: "refutado, sin intentos disponibles para reintentar" });
+    return { status: "blocked" };
+  }
+
+  const attempt = attemptsUsed + 1;
+  record({ event: "attempt_start", attempt });
+
+  const prompt = buildImplementerPrompt(task, `El checker refutó el intento anterior: ${refutedReason}`);
+  const spawned = spawnFn(prompt, { worktreeDir: worktree.dir, config, attempt });
+
+  const scopeNote = detectNeedsScope(spawned.resultText);
+  if (scopeNote) {
+    record({ event: "needs_scope", attempt, note: scopeNote });
+    record({ event: "closed", status: "needs-scope", attempts: attempt });
+    return { status: "needs-scope", note: scopeNote };
+  }
+
+  const verifyResult = runShell(task.verify, worktree.dir);
+  const passed = verifyResult.code === 0;
+  const rawOutput = verifyResult.stderr || verifyResult.stdout;
+  record({
+    event: "verify",
+    attempt,
+    exit: verifyResult.code,
+    ...(passed ? {} : { sig: errorSignature(rawOutput), stderr: rawOutput }),
+  });
+
+  if (!passed) {
+    record({ event: "closed", status: "blocked", attempts: attempt });
+    return { status: "blocked" };
+  }
+
+  return runMechanicalChecks(task, {
+    worktree,
+    baseRef,
+    eventsPath,
+    expectedTestFingerprint: testFingerprint,
+    emit,
+  });
+}
+
+/**
+ * Merge every accepted task's branch into the change branch, in id order.
+ * A conflict here is impossible if the waves were truly disjoint and every
+ * task's scope check passed — so it's reported as a harness bug (a
+ * particionado or scope-check defect), never as something the code did.
+ */
+function mergeAcceptedTasks(accepted, changeWorktree) {
+  const sorted = [...accepted].sort((a, b) => compareIds(a.task.id, b.task.id));
+  for (const c of sorted) {
+    const merge = runGit(
+      ["merge", "--no-ff", "-m", `spec-loop: merge ${c.task.id}`, c.worktree.branch],
+      changeWorktree.dir,
+    );
+    if (merge.code !== 0) {
+      runGit(["merge", "--abort"], changeWorktree.dir);
+      return { status: "merge-conflict", failedTask: c.task.id, stderr: merge.stderr };
+    }
+  }
+  return { status: "merged" };
+}
+
+/**
+ * The barrier for one wave, in the order mechanical-verification's "Barrier
+ * y política ante fallo parcial" requires: checker (up to two passes) →
+ * merge → suite → the optional expensive check. `candidates` are the tasks
+ * that already reached `checks-passed` in group 5 — anything that closed
+ * earlier (stuck/blocked/needs-scope/test-lint-failed/red-check-failed/
+ * out-of-scope) isn't this function's concern; it's already terminal.
+ */
+export function runWaveBarrier(candidates, ctx) {
+  const {
+    changeWorktree,
+    baseRef,
+    config,
+    eventsPath,
+    specDeltaText,
+    architectureText,
+    spawnChecker: spawnCheckerFn,
+    spawnImplementer: spawnImplementerFn,
+    emit = (e) => process.stdout.write(formatEventLine(e) + "\n"),
+  } = ctx;
+
+  const record = (event) => {
+    const full = { ts: new Date().toISOString(), ...event };
+    appendEvent(eventsPath, full);
+    emit(full);
+    return full;
+  };
+
+  if (candidates.length === 0) {
+    return { accepted: [], closed: [], proposedRules: [], barrierStatus: "no-candidates" };
+  }
+
+  const closed = [];
+  const proposedRules = [];
+  const checkerCtx = {
+    baseRef,
+    specDeltaText,
+    architectureText,
+    config,
+    eventsPath,
+    spawnChecker: spawnCheckerFn,
+    emit,
+  };
+
+  const pass1 = runCheckerPass(candidates, checkerCtx);
+  proposedRules.push(...pass1.verdicts.filter((v) => v.rule).map((v) => v.rule));
+
+  let accepted = [];
+  const toRetry = [];
+  for (const c of candidates) {
+    const v = pass1.verdicts.find((v) => v.id === c.task.id);
+    if (v.refuted) toRetry.push({ ...c, refutedReason: v.reason });
+    else accepted.push(c);
+  }
+
+  if (toRetry.length > 0) {
+    const retried = toRetry.map((c) => ({
+      c,
+      result: runRefutationRetry(c.task, {
+        worktree: c.worktree,
+        baseRef,
+        config,
+        eventsPath,
+        attemptsUsed: c.attemptsUsed,
+        refutedReason: c.refutedReason,
+        testFingerprint: c.testFingerprint,
+        spawnImplementer: spawnImplementerFn,
+        emit,
+      }),
+    }));
+
+    for (const r of retried) {
+      if (r.result.status !== "checks-passed") closed.push({ task: r.c.task, status: r.result.status });
+    }
+    const readyForPass2 = retried
+      .filter((r) => r.result.status === "checks-passed")
+      .map((r) => ({ ...r.c, testFingerprint: r.result.testFingerprint }));
+
+    if (readyForPass2.length > 0) {
+      // Second and last pass — "máximo dos pasadas de checker por ola".
+      // Whatever this says is final, no third attempt either way.
+      const pass2 = runCheckerPass(readyForPass2, checkerCtx);
+      proposedRules.push(...pass2.verdicts.filter((v) => v.rule).map((v) => v.rule));
+      for (const c of readyForPass2) {
+        const v = pass2.verdicts.find((v) => v.id === c.task.id);
+        if (v.refuted) {
+          record({ task: c.task.id, event: "closed", status: "blocked", reason: `refutado dos veces: ${v.reason}` });
+          closed.push({ task: c.task, status: "blocked" });
+        } else {
+          accepted.push(c);
+        }
+      }
+    }
+  }
+
+  if (accepted.length === 0) {
+    return { accepted: [], closed, proposedRules, barrierStatus: "nothing-to-merge" };
+  }
+
+  const mergeResult = mergeAcceptedTasks(accepted, changeWorktree);
+  record({ event: "merge", ok: mergeResult.status === "merged", failedTask: mergeResult.failedTask });
+  if (mergeResult.status !== "merged") {
+    return { accepted, closed, proposedRules, barrierStatus: "merge-conflict", failedTask: mergeResult.failedTask };
+  }
+
+  const suiteResult = runShell(config.test, changeWorktree.dir);
+  record({ event: "suite", ok: suiteResult.code === 0 });
+  if (suiteResult.code !== 0) {
+    return {
+      accepted,
+      closed,
+      proposedRules,
+      barrierStatus: "integration-failed",
+      stderr: suiteResult.stderr || suiteResult.stdout,
+    };
+  }
+
+  if (config.barrier) {
+    const expensiveResult = runShell(config.barrier, changeWorktree.dir);
+    record({ event: "barrier_check", ok: expensiveResult.code === 0 });
+    if (expensiveResult.code !== 0) {
+      return {
+        accepted,
+        closed,
+        proposedRules,
+        barrierStatus: "integration-failed",
+        stderr: expensiveResult.stderr || expensiveResult.stdout,
+      };
+    }
+  }
+
+  return { accepted, closed, proposedRules, barrierStatus: "ok" };
 }
 
 /** `spec-loop` — preflight, print the waves, exit. Costs zero tokens. */
