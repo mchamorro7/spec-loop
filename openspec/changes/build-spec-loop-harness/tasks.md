@@ -57,14 +57,14 @@
 
 ## 7. Estado, reporte y salida
 
-- [ ] 7.1 `derive()`: estado del run desde `events.jsonl`; cruzar contra las ramas del change y hacer prevalecer git ante discrepancia
-- [ ] 7.2 `spec-loop status`: imprimir el estado derivado
-- [ ] 7.3 Resume: saltear lo cerrado y continuar; correr de más no rehace trabajo
-- [ ] 7.4 Negarse a reintentar tareas rojas si no cambió el contrato de alguna tarea ni la base; el hash del contrato cubre los bloques `yaml` y la prosa, nunca los checkboxes (D14)
-- [ ] 7.5 Proyectar el progreso marcando el checkbox de cada tarea mergeada, sin leerlo nunca y sin tocar el bloque `yaml` ni la prosa
-- [ ] 7.6 Acumular costo en dólares por spawn y detener al superar el techo, terminando la ola en curso sin matar spawns en vuelo
-- [ ] 7.7 Reporte en el orden rojo → riesgo residual → advertencias → verde → totales, a la salida estándar y a un archivo del change
-- [ ] 7.8 Exit codes por tipo de fallo, distinguiendo preflight, tareas rojas, change detenido y techo de gasto agotado
+- [x] 7.1 `derive()`: estado del run desde `events.jsonl`; cruzar contra las ramas del change y hacer prevalecer git ante discrepancia
+- [x] 7.2 `spec-loop status`: imprimir el estado derivado
+- [x] 7.3 Resume: saltear lo cerrado y continuar; correr de más no rehace trabajo
+- [x] 7.4 Negarse a reintentar tareas rojas si no cambió el contrato de alguna tarea ni la base; el hash del contrato cubre los bloques `yaml` y la prosa, nunca los checkboxes (D14)
+- [x] 7.5 Proyectar el progreso marcando el checkbox de cada tarea mergeada, sin leerlo nunca y sin tocar el bloque `yaml` ni la prosa
+- [x] 7.6 Acumular costo en dólares por spawn y detener al superar el techo, terminando la ola en curso sin matar spawns en vuelo
+- [x] 7.7 Reporte en el orden rojo → riesgo residual → advertencias → verde → totales, a la salida estándar y a un archivo del change
+- [x] 7.8 Exit codes por tipo de fallo, distinguiendo preflight, tareas rojas, change detenido y techo de gasto agotado
 
 ## 8. Agentes
 

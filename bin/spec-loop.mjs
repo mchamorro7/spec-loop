@@ -12,7 +12,7 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { cpus } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -536,9 +536,100 @@ export function resolveChange(roadmapText, activeChanges) {
   };
 }
 
-/** Derive run state from the events log. See task 7.1. */
-export function deriveState(_events) {
-  throw new Error("deriveState: not yet implemented (task 7.1)");
+/**
+ * Derive the run's state from its event log — never from a summary a model
+ * wrote. `events` is already-parsed JSONL (reading the file is the
+ * caller's job); this function is pure. A task's status is whatever its
+ * one-and-only `closed` event says (D-something: by construction a task
+ * gets exactly one, since "verified" only fires at merge time, not when
+ * the attempt loop merely passes `verify`). Cost accumulates from
+ * `closed` events (task-specific) and `checker_spend` events (wave-level,
+ * kept separate so a checker pass covering N tasks never gets counted
+ * once per task). See task 7.1.
+ */
+export function deriveState(events) {
+  const tasks = {};
+  let totalCostUsd = 0;
+  const proposedRules = [];
+  let lastRunStart = null;
+
+  for (const e of events ?? []) {
+    if (e.event === "run_start") {
+      lastRunStart = { contractHash: e.contract_hash, baseSha: e.base_sha };
+    } else if (e.event === "closed" && e.task) {
+      tasks[e.task] = {
+        status: e.status,
+        attempts: typeof e.attempts === "number" ? e.attempts : null,
+        costUsd: typeof e.cost_usd === "number" ? e.cost_usd : 0,
+        wallS: typeof e.wall_s === "number" ? e.wall_s : null,
+        reason: e.reason ?? null,
+      };
+      if (typeof e.cost_usd === "number") totalCostUsd += e.cost_usd;
+    } else if (e.event === "checker_spend" && typeof e.cost_usd === "number") {
+      totalCostUsd += e.cost_usd;
+    } else if (e.event === "checker_verdict" && e.rule) {
+      proposedRules.push({ taskId: e.id, rule: e.rule });
+    }
+  }
+
+  return { tasks, totalCostUsd: round2(totalCostUsd), proposedRules, lastRunStart };
+}
+
+/**
+ * Wall-clock of a run as observed from its own event timestamps — used by
+ * `spec-loop status` (no live process to time) and by the report's speedup
+ * estimate. Pure: events are already-parsed data.
+ */
+export function estimateRunWallS(events) {
+  const times = (events ?? [])
+    .map((e) => new Date(e.ts).getTime())
+    .filter((t) => Number.isFinite(t));
+  if (times.length === 0) return 0;
+  return Math.max(1, Math.round((Math.max(...times) - Math.min(...times)) / 1000));
+}
+
+/**
+ * A stable hash of the change's *contract* — the yaml block and prose of
+ * every task, never the checkboxes (the runner's own progress projection,
+ * task 7.5) and never `id` (it's already the map key / sort key elsewhere).
+ * This is what "Reintentar exige un delta" compares: the runner marking a
+ * checkbox must never look like a plan change. See task 7.4.
+ */
+export function computeContractHash(tasks) {
+  const canonical = [...tasks]
+    .sort((a, b) => compareIds(a.id, b.id))
+    .map((t) =>
+      JSON.stringify({
+        id: t.id,
+        proves: t.proves,
+        files: t.files,
+        verify: t.verify,
+        needs: t.needs,
+        redCheck: t.redCheck,
+        prose: t.prose,
+      }),
+    )
+    .join("\n");
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+/**
+ * Mark the checkbox of every task in `verifiedIds` as done — the runner's
+ * one-way progress projection (task 7.5). Never reads a checkbox's current
+ * state to decide anything; only ever writes `[x]` for an id it's told is
+ * verified. Everything else on the line, the yaml block, and the prose are
+ * byte-for-byte untouched.
+ */
+export function projectCheckboxes(tasksMdText, verifiedIds) {
+  const idSet = new Set(verifiedIds);
+  const lines = tasksMdText.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const m = CHECKBOX_RE.exec(lines[i]);
+    if (m && idSet.has(m[2])) {
+      lines[i] = lines[i].replace(/^-(\s)\[[ xX]\]/, "-$1[x]");
+    }
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -872,6 +963,123 @@ export function propagateBlockedByDep(remainingTasks, redIds, mergedIds = []) {
   return { blockedByDep, waves: waves ?? [], errors };
 }
 
+const DECISION_HINT = {
+  stuck: "el mismo error se repitió dos veces: revisá el verify: o arreglá la tarea a mano",
+  blocked: "se agotaron los intentos: revisá el verify: o partí la tarea",
+  "needs-scope": "el implementer necesita tocar algo que no le pertenece: ampliá files: o dividí la tarea",
+  "test-lint-failed": "el test no prueba nada: reescribilo antes de reintentar",
+  "red-check-failed": "el test pasa sin la implementación: reescribilo antes de reintentar",
+  "out-of-scope": "tocó algo no declarado en files:, o el test cambió después de congelado",
+  "blocked-by-dep": "depende de una tarea roja: resolvé esa primero, después esta",
+};
+
+/**
+ * The report, in the order run-observability's "El reporte abre por lo no
+ * verificado" requires: red, residual risk, warnings, green, totals. Lo
+ * verde ya lo probó una máquina; lo que pide atención va primero. Pure:
+ * `tasks` is the parsed contract (for red-check:skip reasons), `state` is
+ * deriveState's output, `runWallS` is the actual parallel wall-clock of
+ * this run (for the speedup estimate). See task 7.7.
+ */
+export function formatReport(changeName, tasks, state, config, runWallS) {
+  const lines = [`spec-loop · ${changeName} · reporte`, ""];
+  const verifiedIds = new Set(
+    Object.entries(state.tasks)
+      .filter(([, s]) => s.status === "verified")
+      .map(([id]) => id),
+  );
+  const green = tasks.filter((t) => verifiedIds.has(t.id)).map((t) => [t.id, state.tasks[t.id]]);
+  const notVerified = tasks.filter((t) => !verifiedIds.has(t.id));
+
+  lines.push("## Rojo");
+  if (notVerified.length === 0) {
+    lines.push("(ninguna)");
+  } else {
+    for (const t of notVerified) {
+      const s = state.tasks[t.id];
+      if (s) {
+        lines.push(`- ${t.id}  ${s.status}${s.reason ? `  — ${s.reason}` : ""}`);
+        lines.push(`  destraba: ${DECISION_HINT[s.status] ?? "revisión manual"}`);
+      } else {
+        lines.push(`- ${t.id}  no llegó a correr`);
+        lines.push(`  destraba: el change se detuvo antes de esta tarea; corré spec-loop run de nuevo una vez resuelto lo anterior`);
+      }
+    }
+  }
+  lines.push("");
+
+  lines.push("## Riesgo residual");
+  let anyResidual = false;
+  for (const t of tasks.filter((t) => t.redCheck.mode === "skip")) {
+    lines.push(`- ${t.id}  red-check: skip — ${t.redCheck.reason}`);
+    anyResidual = true;
+  }
+  for (const r of state.proposedRules) {
+    const rationale = r.rule.rationale ? ` — ${r.rule.rationale}` : "";
+    lines.push(`- regla propuesta por el checker (${r.taskId}): ${r.rule.ruleSource ?? "sin nombre"}${rationale}`);
+    anyResidual = true;
+  }
+  if (!anyResidual) lines.push("(ninguno)");
+  lines.push("");
+
+  lines.push("## Advertencias");
+  const warnings = green.filter(
+    ([, s]) => s.attempts === config.maxAttempts || (s.reason && s.reason.includes("refutado")),
+  );
+  if (warnings.length === 0) {
+    lines.push("(ninguna)");
+  } else {
+    for (const [id, s] of warnings) {
+      const why = s.reason ? s.reason : `cerró en el último intento disponible (${s.attempts})`;
+      lines.push(`- ${id}  ${why} — vale la pena revisarla a mano`);
+    }
+  }
+  lines.push("");
+
+  lines.push("## Verde");
+  if (green.length === 0) {
+    lines.push("(ninguna)");
+  } else {
+    for (const [id, s] of green) {
+      lines.push(`- ${id}  ${s.attempts} intentos  ${s.wallS}s  $${s.costUsd.toFixed(2)}`);
+    }
+  }
+  lines.push("");
+
+  const entries = Object.entries(state.tasks);
+  const sumWallS = entries.reduce((acc, [, s]) => acc + (s.wallS ?? 0), 0);
+  const speedup = runWallS > 0 ? sumWallS / runWallS : null;
+  const firstAttemptEligible = entries.filter(([, s]) => typeof s.attempts === "number");
+  const firstAttemptOk = firstAttemptEligible.filter(([, s]) => s.status === "verified" && s.attempts === 1);
+  const passRate = firstAttemptEligible.length > 0 ? firstAttemptOk.length / firstAttemptEligible.length : null;
+
+  lines.push("## Totales");
+  lines.push(`costo: $${state.totalCostUsd.toFixed(2)}`);
+  lines.push(`aceleración vs. secuencial (estimada): ${speedup !== null ? speedup.toFixed(1) + "x" : "n/d"}`);
+  lines.push(`tasa de éxito al primer intento: ${passRate !== null ? Math.round(passRate * 100) + "%" : "n/d"}`);
+
+  return lines.join("\n") + "\n";
+}
+
+/** Every task in `tasks` that isn't verified yet — the same concept formatReport's "Rojo" section uses. */
+export function unverifiedTaskIds(tasks, state) {
+  return tasks.filter((t) => state.tasks[t.id]?.status !== "verified").map((t) => t.id);
+}
+
+/**
+ * Exit codes per "Exit codes por tipo de fallo": 0 all verified and merged,
+ * 1 the change ended with red tasks, 2 preflight failed, 3 the change
+ * stopped (merge conflict or a red suite), 4 the spend ceiling was hit.
+ * Pure: takes a small outcome descriptor, not the whole run state.
+ */
+export function computeExitCode(outcome) {
+  if (outcome.preflightFailed) return 2;
+  if (outcome.spendExceeded) return 4;
+  if (outcome.changeStopped) return 3;
+  if (outcome.hasRedTasks) return 1;
+  return 0;
+}
+
 // ---------------------------------------------------------------------------
 // EFFECTS — worktrees, spawns, git, the filesystem, and the CLI dispatch
 // below are the only places allowed to do those things. The task pipeline
@@ -927,6 +1135,49 @@ function loadRepoConfig() {
     return { config: null, errors: ["no existe spec-loop.yaml en la raíz del repo"] };
   }
   return loadConfig(text, cpus().length);
+}
+
+/** Read + parse events.jsonl, tolerant of a missing file (nothing has run yet) or a blank line. */
+function readEventsLog(eventsPath) {
+  if (!existsSync(eventsPath)) return [];
+  return readFileSync(eventsPath, "utf8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function eventsPathFor(changeName, repoRoot = REPO_ROOT) {
+  return join(repoRoot, ".spec-loop", changeName, "events.jsonl");
+}
+
+/**
+ * Resume idempotence's other half: the log can say a task is "verified" if
+ * the process died in the narrow window between the merge succeeding and
+ * the event actually landing on disk. Git is the ground truth for anything
+ * that touches the change branch, so a "verified" task the change branch's
+ * history doesn't actually contain gets treated as never closed — the next
+ * run picks it back up instead of silently skipping it.
+ */
+function crossCheckVerifiedAgainstGit(state, changeWorktree) {
+  const verifiedIds = Object.entries(state.tasks)
+    .filter(([, s]) => s.status === "verified")
+    .map(([id]) => id);
+  if (verifiedIds.length === 0) return state;
+
+  const tasks = { ...state.tasks };
+  for (const id of verifiedIds) {
+    const found = runGit(["log", "--grep", `Spec-Loop-Task: ${id}`, "--format=%H", "-n", "1"], changeWorktree.dir);
+    if (found.code !== 0 || found.stdout.trim() === "") delete tasks[id];
+  }
+  return { ...state, tasks };
 }
 
 /**
@@ -1600,6 +1851,10 @@ function mergeAcceptedTasks(accepted, changeWorktree, record) {
       attempts: c.attemptsUsed,
       cost_usd: round2(c.costUsd ?? 0),
       wall_s: c.wallS ?? 0,
+      // Flagged for the report's "advertencias" block, not for anything
+      // mechanical: a task refuted once and accepted on retry is exactly
+      // the shape of thing nobody would otherwise think to double-check.
+      ...(c.wasRefuted ? { reason: "refutado y aceptado tras reintento" } : {}),
     });
     merged.push(c);
   }
@@ -1689,6 +1944,7 @@ export function runWaveBarrier(candidates, ctx) {
         testFingerprint: r.result.testFingerprint,
         costUsd: r.result.costUsd,
         wallS: r.result.wallS,
+        wasRefuted: true,
       }));
 
     if (readyForPass2.length > 0) {
@@ -1902,14 +2158,195 @@ async function bare() {
   process.stdout.write(formatWaves(result.change, result.waves));
 }
 
-/** `spec-loop run` — preflight, print the waves, execute. */
+/**
+ * `spec-loop run` — preflight, print the waves, execute unattended: wave by
+ * wave, pool-concurrent tasks, then the barrier, until the change closes,
+ * stops, or the spend ceiling is hit. Never asks anything in-flight.
+ */
 async function run() {
-  throw new Error("run: not yet implemented (group 4-7)");
+  const { config, errors: configErrors } = loadRepoConfig();
+  if (configErrors.length > 0) {
+    printErrors(configErrors);
+    process.exitCode = computeExitCode({ preflightFailed: true });
+    return;
+  }
+
+  const preflightResult = preflightCurrentChange(config);
+  if (preflightResult.message) {
+    process.stdout.write(preflightResult.message + "\n");
+    return;
+  }
+  if (!preflightResult.ok) {
+    printErrors(preflightResult.errors);
+    process.exitCode = computeExitCode({ preflightFailed: true });
+    return;
+  }
+
+  const changeName = preflightResult.change;
+  const changeDir = join(CHANGES_DIR, changeName);
+  const tasksPath = join(changeDir, "tasks.md");
+  const tasksText = readFileSync(tasksPath, "utf8");
+  const { tasks: allTasks } = parseTasks(tasksText);
+  const eventsPath = eventsPathFor(changeName);
+
+  let state = deriveState(readEventsLog(eventsPath));
+  if (existsSync(changeWorktreeDir(REPO_ROOT))) {
+    state = crossCheckVerifiedAgainstGit(state, { dir: changeWorktreeDir(REPO_ROOT) });
+  }
+
+  const contractHash = computeContractHash(allTasks);
+  const baseSha = runGit(["rev-parse", "HEAD"], REPO_ROOT).stdout.trim();
+  const priorEvents = readEventsLog(eventsPath);
+
+  // "Reintentar exige un delta": only tasks that were actually attempted and
+  // came back red count -- a task that simply hasn't run yet (a normal
+  // resume) isn't a reason to refuse.
+  const redIds = unverifiedTaskIds(allTasks, state).filter((id) => state.tasks[id] !== undefined);
+  if (priorEvents.length > 0 && redIds.length > 0) {
+    const last = state.lastRunStart;
+    if (last && last.contractHash === contractHash && last.baseSha === baseSha) {
+      printErrors([
+        `nada cambió desde el último run: ${redIds.join(", ")} sigue(n) roja(s). Corregí tasks.md, avanzá la base, o dejá una nota, y volvé a correr.`,
+      ]);
+      process.exitCode = computeExitCode({ hasRedTasks: true });
+      return;
+    }
+  }
+
+  appendEvent(eventsPath, { event: "run_start", contract_hash: contractHash, base_sha: baseSha });
+
+  const changeWorktree = ensureChangeWorktree(changeName, REPO_ROOT);
+  const specDeltaText = collectMarkdown(join(changeDir, "specs"));
+  const architectureText = readIfExists(join(REPO_ROOT, "openspec", "architecture.md")) ?? "";
+
+  const verifiedIds = Object.entries(state.tasks)
+    .filter(([, s]) => s.status === "verified")
+    .map(([id]) => id);
+  const pendingTasks = allTasks.filter((t) => !verifiedIds.includes(t.id));
+
+  const { waves: initialWaves, errors: initialWaveErrors } = planWaves(pendingTasks, verifiedIds);
+  if (initialWaveErrors.length > 0) {
+    printErrors(initialWaveErrors);
+    process.exitCode = computeExitCode({ preflightFailed: true });
+    return;
+  }
+
+  let waves = initialWaves;
+  const mergedSoFar = [...verifiedIds];
+  let changeStopped = false;
+  let spendExceeded = false;
+
+  while (waves.length > 0) {
+    const wave = waves[0];
+    const waveBaseRef = currentWaveBase(changeWorktree);
+
+    const results = await runWaveTasksConcurrently(
+      wave,
+      { changeName, baseRef: waveBaseRef, config, eventsPath, repoRoot: REPO_ROOT },
+      config.jobs,
+    );
+    const candidates = results.filter((r) => r.candidate).map((r) => r.candidate);
+    const failedIds = results.filter((r) => r.terminal).map((r) => r.taskId);
+
+    const barrierResult = runWaveBarrier(candidates, {
+      changeWorktree,
+      baseRef: waveBaseRef,
+      config,
+      eventsPath,
+      specDeltaText,
+      architectureText,
+    });
+
+    if (barrierResult.barrierStatus === "merge-conflict" || barrierResult.barrierStatus === "integration-failed") {
+      changeStopped = true;
+      break;
+    }
+
+    mergedSoFar.push(...barrierResult.accepted.map((c) => c.task.id));
+
+    // Never kill spawns in flight: the ceiling is checked once the wave
+    // that's already running finishes, not mid-wave.
+    if (deriveState(readEventsLog(eventsPath)).totalCostUsd >= config.maxSpend) {
+      spendExceeded = true;
+      break;
+    }
+
+    const stillPending = waves.slice(1).flat();
+    if (stillPending.length === 0) break;
+
+    const redFromThisWave = [...failedIds, ...barrierResult.closed.map((c) => c.task.id)];
+    const { blockedByDep, waves: recalced, errors: recalcErrors } = propagateBlockedByDep(
+      stillPending,
+      redFromThisWave,
+      mergedSoFar,
+    );
+    for (const bd of blockedByDep) {
+      appendEvent(eventsPath, { task: bd.id, event: "closed", status: "blocked-by-dep" });
+    }
+    if (recalcErrors.length > 0) {
+      printErrors(recalcErrors);
+      changeStopped = true;
+      break;
+    }
+    waves = recalced;
+  }
+
+  const finalEvents = readEventsLog(eventsPath);
+  let finalState = deriveState(finalEvents);
+  finalState = crossCheckVerifiedAgainstGit(finalState, changeWorktree);
+
+  const finalVerifiedIds = Object.entries(finalState.tasks)
+    .filter(([, s]) => s.status === "verified")
+    .map(([id]) => id);
+  const projectedTasksText = projectCheckboxes(tasksText, finalVerifiedIds);
+  if (projectedTasksText !== tasksText) writeFileSync(tasksPath, projectedTasksText);
+
+  const reportText = formatReport(changeName, allTasks, finalState, config, estimateRunWallS(finalEvents));
+  process.stdout.write(reportText);
+  const reportPath = join(REPO_ROOT, ".spec-loop", changeName, "report.md");
+  mkdirSync(dirname(reportPath), { recursive: true });
+  writeFileSync(reportPath, reportText);
+
+  process.exitCode = computeExitCode({
+    changeStopped,
+    spendExceeded,
+    hasRedTasks: unverifiedTaskIds(allTasks, finalState).length > 0,
+  });
 }
 
-/** `spec-loop status` — print state derived from events.jsonl. */
+/** `spec-loop status` — the state derived from events.jsonl, cross-checked against git. Never runs the gate. */
 async function status() {
-  throw new Error("status: not yet implemented (task 7.2)");
+  const { config, errors: configErrors } = loadRepoConfig();
+  if (configErrors.length > 0) {
+    printErrors(configErrors);
+    process.exitCode = 2;
+    return;
+  }
+
+  const roadmapText = readIfExists(ROADMAP_PATH);
+  const activeChanges = listActiveChanges();
+  const resolved = resolveChange(roadmapText, activeChanges);
+  if (resolved.errors.length > 0) {
+    printErrors(resolved.errors);
+    process.exitCode = 2;
+    return;
+  }
+  if (resolved.change === null) {
+    process.stdout.write(resolved.message + "\n");
+    return;
+  }
+
+  const changeName = resolved.change;
+  const tasksText = readFileSync(join(CHANGES_DIR, changeName, "tasks.md"), "utf8");
+  const { tasks } = parseTasks(tasksText);
+
+  const events = readEventsLog(eventsPathFor(changeName));
+  let state = deriveState(events);
+  if (existsSync(changeWorktreeDir(REPO_ROOT))) {
+    state = crossCheckVerifiedAgainstGit(state, { dir: changeWorktreeDir(REPO_ROOT) });
+  }
+
+  process.stdout.write(formatReport(changeName, tasks, state, config, estimateRunWallS(events)));
 }
 
 async function main(argv) {
