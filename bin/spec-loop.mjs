@@ -12,9 +12,11 @@
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { cpus } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 import { parse as parseYaml } from "yaml";
 
 // ---------------------------------------------------------------------------
@@ -1701,6 +1703,136 @@ export function runWaveBarrier(candidates, ctx) {
   return { accepted, closed, proposedRules, barrierStatus: "ok" };
 }
 
+// ---------------------------------------------------------------------------
+// CONCURRENCY (task 6.6) — every child_process call in this file is
+// spawnSync (blocking), which is correct *within* one task's pipeline but
+// means a plain loop over N tasks can never run them at the same time no
+// matter how it's structured. Real concurrency needs separate OS threads:
+// each worker runs its own synchronous pipeline+checks (unchanged, group
+// 4/5 code), and the OS schedules their underlying subprocesses in
+// parallel. Kept in this one file per D11 — a worker is just this same
+// module loaded with `isMainThread === false`, not a second file.
+// ---------------------------------------------------------------------------
+
+const WORKER_ENTRYPOINT = fileURLToPath(import.meta.url);
+
+/**
+ * Runs inside a worker thread: one task's full pipeline (group 4) then, if
+ * it verified, the mechanical checks (group 5). `spawnImplementerOverride`
+ * exists only for tests — a real run always uses the production default,
+ * since a function can't cross the worker boundary via postMessage.
+ */
+function runTaskInWorker(data, spawnImplementerOverride) {
+  const { task, changeName, baseRef, config, eventsPath, repoRoot } = data;
+  try {
+    const pipelineCtx = { changeName, baseRef, config, eventsPath, repoRoot };
+    if (spawnImplementerOverride) pipelineCtx.spawnImplementer = spawnImplementerOverride;
+    const pipelineResult = runTaskPipeline(task, pipelineCtx);
+
+    if (pipelineResult.status !== "verified") {
+      return { taskId: task.id, terminal: pipelineResult.status };
+    }
+
+    const checksResult = runMechanicalChecks(task, {
+      worktree: pipelineResult.worktree,
+      baseRef,
+      eventsPath,
+    });
+
+    return checksResult.status === "checks-passed"
+      ? {
+          taskId: task.id,
+          candidate: {
+            task,
+            worktree: pipelineResult.worktree,
+            attemptsUsed: pipelineResult.attempts,
+            testFingerprint: checksResult.testFingerprint,
+          },
+        }
+      : { taskId: task.id, terminal: checksResult.status };
+  } catch (err) {
+    return { taskId: task.id, terminal: "error", error: err.message };
+  }
+}
+
+/**
+ * Run a wave's tasks with real concurrency, up to `jobs` workers at once.
+ * Each worker writes its events to a private temp file — concurrent
+ * appends to the shared events.jsonl from separate OS threads aren't
+ * guaranteed atomic once a line grows past a few KB (exactly the case for a
+ * verify failure's full, untruncated stderr), so the main thread stays the
+ * only writer to it, consolidating each worker's temp file as it exits.
+ * See task 6.6.
+ */
+export function runWaveTasksConcurrently(tasks, ctx, jobs) {
+  const { changeName, baseRef, config, eventsPath, repoRoot, spawnImplementerModulePath } = ctx;
+
+  return new Promise((resolve) => {
+    if (tasks.length === 0) {
+      resolve([]);
+      return;
+    }
+
+    const results = [];
+    let nextIndex = 0;
+    let active = 0;
+
+    function consolidate(tempPath) {
+      if (!existsSync(tempPath)) return;
+      const lines = readFileSync(tempPath, "utf8");
+      if (lines) appendFileSync(eventsPath, lines);
+      rmSync(tempPath, { force: true });
+    }
+
+    function launchNext() {
+      while (active < jobs && nextIndex < tasks.length) {
+        const task = tasks[nextIndex++];
+        const tempEventsPath = `${eventsPath}.worker-${task.id}.jsonl`;
+        active++;
+
+        const worker = new Worker(WORKER_ENTRYPOINT, {
+          workerData: {
+            task,
+            changeName,
+            baseRef,
+            config,
+            eventsPath: tempEventsPath,
+            repoRoot,
+            spawnImplementerModulePath,
+          },
+        });
+
+        const finish = (message) => {
+          consolidate(tempEventsPath);
+          results.push(message);
+          active--;
+          if (active === 0 && nextIndex >= tasks.length) resolve(results);
+          else launchNext();
+        };
+
+        worker.on("message", finish);
+        worker.on("error", (err) => finish({ taskId: task.id, terminal: "error", error: err.message }));
+      }
+    }
+
+    launchNext();
+  });
+}
+
+if (!isMainThread) {
+  // Worker mode: run exactly one task and post the result back.
+  // spawnImplementerModulePath is a test-only seam — a real run never sets
+  // it, and the dynamic import only ever happens with a path this same
+  // process constructed, never with untrusted input.
+  const data = workerData;
+  const loadOverride = data.spawnImplementerModulePath
+    ? import(pathToFileURL(data.spawnImplementerModulePath).href).then((m) => m.default)
+    : Promise.resolve(undefined);
+  loadOverride.then((override) => {
+    parentPort.postMessage(runTaskInWorker(data, override));
+  });
+}
+
 /** `spec-loop` — preflight, print the waves, exit. Costs zero tokens. */
 async function bare() {
   const { config, errors: configErrors } = loadRepoConfig();
@@ -1755,6 +1887,6 @@ async function main(argv) {
   process.exitCode = 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isMainThread && import.meta.url === `file://${process.argv[1]}`) {
   main(process.argv);
 }

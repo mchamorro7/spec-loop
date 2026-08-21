@@ -53,7 +53,7 @@
 - [x] 6.3 Barrier: merge de las verificadas en orden de `id`; conflicto → detener el change y reportarlo como bug del harness
 - [x] 6.4 Suite del proyecto sobre la rama del change, siempre con concurrencia 1; roja → detener el change sin revertir nada. Después, correr el comando de chequeo caro si está declarado, con la misma política
 - [x] 6.5 Propagar bloqueo por clausura de `needs` sobre tareas rojas y recalcular las olas restantes
-- [ ] 6.6 Habilitar concurrencia mayor a 1 con un pool del tamaño de `jobs`
+- [x] 6.6 Habilitar concurrencia mayor a 1 con un pool del tamaño de `jobs`
 
 ## 7. Estado, reporte y salida
 
