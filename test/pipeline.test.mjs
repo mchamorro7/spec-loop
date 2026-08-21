@@ -62,13 +62,16 @@ test("runTaskPipeline: verifies on the first attempt when the implementer's work
 
     assert.equal(result.status, "verified");
     assert.equal(result.attempts, 1);
+    assert.equal(result.costUsd, 0.05);
     assert.ok(existsSync(result.worktree.dir), "the worktree must exist for later checks (group 5) to run in");
 
+    // No "closed" event yet: "verified" here only means the loop's own job
+    // is done. The task isn't terminal until group 5's checks and group 6's
+    // checker/merge have their say -- emitting "closed" now would tell
+    // events.jsonl the task is done before it actually is.
     const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-    assert.deepEqual(events.map((e) => e.event), ["attempt_start", "verify", "closed"]);
+    assert.deepEqual(events.map((e) => e.event), ["attempt_start", "verify"]);
     assert.equal(events[1].exit, 0);
-    assert.equal(events[2].status, "verified");
-    assert.equal(events[2].cost_usd, 0.05);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }

@@ -71,6 +71,8 @@ function makeAcceptedCandidate(root, changeName, baseRef, taskId, { fileBody, te
     worktree: { dir: wtDir, branch: `spec-loop/${changeName}/${taskId}` },
     attemptsUsed: 1,
     testFingerprint: result.testFingerprint,
+    costUsd: 0.05,
+    wallS: 12,
   };
 }
 
@@ -114,6 +116,17 @@ test("runWaveBarrier: all candidates accepted merge cleanly and the suite passes
     // Both files must exist on the change branch now.
     assert.ok(readFileSync(join(changeWorktree.dir, "src/1.1.mjs"), "utf8").includes("1.1"));
     assert.ok(readFileSync(join(changeWorktree.dir, "src/1.2.mjs"), "utf8").includes("1.2"));
+
+    // "closed: verified" fires here -- at merge time -- not earlier in the
+    // pipeline, and it carries the accumulated cost/attempts for deriveState.
+    const events = readFileSync(join(root, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    const verifiedClosed = events.filter((e) => e.event === "closed" && e.status === "verified");
+    assert.deepEqual(verifiedClosed.map((e) => e.task).sort(), ["1.1", "1.2"]);
+    assert.ok(verifiedClosed.every((e) => e.cost_usd === 0.05));
+
+    // The checker's own cost is a separate, wave-level event -- never
+    // duplicated onto either task's closed event.
+    assert.ok(events.some((e) => e.event === "checker_spend"));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

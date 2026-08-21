@@ -1169,15 +1169,11 @@ export function runTaskPipeline(task, ctx) {
 
     const scopeNote = detectNeedsScope(spawned.resultText);
     if (scopeNote) {
+      const costUsd = round2(totalCostUsd);
+      const wallS = Math.round((Date.now() - startedAt) / 1000);
       record({ event: "needs_scope", attempt, note: scopeNote });
-      record({
-        event: "closed",
-        status: "needs-scope",
-        attempts: attempt,
-        cost_usd: round2(totalCostUsd),
-        wall_s: Math.round((Date.now() - startedAt) / 1000),
-      });
-      return { status: "needs-scope", attempts: attempt, worktree, note: scopeNote };
+      record({ event: "closed", status: "needs-scope", attempts: attempt, cost_usd: costUsd, wall_s: wallS });
+      return { status: "needs-scope", attempts: attempt, worktree, note: scopeNote, costUsd, wallS };
     }
 
     const verifyResult = runShell(task.verify, worktree.dir);
@@ -1208,14 +1204,18 @@ export function runTaskPipeline(task, ctx) {
       continue;
     }
 
-    record({
-      event: "closed",
-      status: outcome.status,
-      attempts: attempt,
-      cost_usd: round2(totalCostUsd),
-      wall_s: Math.round((Date.now() - startedAt) / 1000),
-    });
-    return { status: outcome.status, attempts: attempt, worktree };
+    const costUsd = round2(totalCostUsd);
+    const wallS = Math.round((Date.now() - startedAt) / 1000);
+    // "verified" here means the loop's own job is done -- verify passed. It
+    // is NOT the terminal state: group 5's checks and group 6's checker
+    // still get a say, and a task can still fail after this. The real
+    // "closed: verified" is emitted once its merge actually succeeds
+    // (mergeAcceptedTasks) -- emitting it here would tell events.jsonl the
+    // task is done before it is.
+    if (outcome.status !== "verified") {
+      record({ event: "closed", status: outcome.status, attempts: attempt, cost_usd: costUsd, wall_s: wallS });
+    }
+    return { status: outcome.status, attempts: attempt, worktree, costUsd, wallS };
   }
 }
 
@@ -1475,6 +1475,12 @@ function runCheckerPass(candidates, ctx) {
     appendEvent(eventsPath, full);
     emit(full);
   }
+  // Its own event, separate from any task's `closed` cost_usd: the checker
+  // covers N tasks in one spawn, so its cost isn't any single task's to
+  // carry -- summing it in would double-count against the run total.
+  const spendEvent = { ts: new Date().toISOString(), event: "checker_spend", cost_usd: round2(costUsd) };
+  appendEvent(eventsPath, spendEvent);
+  emit(spendEvent);
 
   return { verdicts, costUsd };
 }
@@ -1495,9 +1501,12 @@ function runRefutationRetry(task, ctx) {
     attemptsUsed,
     refutedReason,
     testFingerprint,
+    priorCostUsd = 0,
+    priorWallS = 0,
     spawnImplementer: spawnFn = spawnImplementer,
     emit = (e) => process.stdout.write(formatEventLine(e) + "\n"),
   } = ctx;
+  const startedAt = Date.now();
 
   const record = (event) => {
     const full = { ts: new Date().toISOString(), task: task.id, ...event };
@@ -1505,9 +1514,17 @@ function runRefutationRetry(task, ctx) {
     emit(full);
     return full;
   };
+  const elapsed = () => priorWallS + Math.round((Date.now() - startedAt) / 1000);
 
   if (attemptsUsed >= config.maxAttempts) {
-    record({ event: "closed", status: "blocked", attempts: attemptsUsed, reason: "refutado, sin intentos disponibles para reintentar" });
+    record({
+      event: "closed",
+      status: "blocked",
+      attempts: attemptsUsed,
+      cost_usd: round2(priorCostUsd),
+      wall_s: elapsed(),
+      reason: "refutado, sin intentos disponibles para reintentar",
+    });
     return { status: "blocked" };
   }
 
@@ -1516,11 +1533,12 @@ function runRefutationRetry(task, ctx) {
 
   const prompt = buildImplementerPrompt(task, `El checker refutó el intento anterior: ${refutedReason}`);
   const spawned = spawnFn(prompt, { worktreeDir: worktree.dir, config, attempt });
+  const costUsd = round2(priorCostUsd + (spawned.costUsd ?? 0));
 
   const scopeNote = detectNeedsScope(spawned.resultText);
   if (scopeNote) {
     record({ event: "needs_scope", attempt, note: scopeNote });
-    record({ event: "closed", status: "needs-scope", attempts: attempt });
+    record({ event: "closed", status: "needs-scope", attempts: attempt, cost_usd: costUsd, wall_s: elapsed() });
     return { status: "needs-scope", note: scopeNote };
   }
 
@@ -1535,17 +1553,18 @@ function runRefutationRetry(task, ctx) {
   });
 
   if (!passed) {
-    record({ event: "closed", status: "blocked", attempts: attempt });
+    record({ event: "closed", status: "blocked", attempts: attempt, cost_usd: costUsd, wall_s: elapsed() });
     return { status: "blocked" };
   }
 
-  return runMechanicalChecks(task, {
+  const checksResult = runMechanicalChecks(task, {
     worktree,
     baseRef,
     eventsPath,
     expectedTestFingerprint: testFingerprint,
     emit,
   });
+  return { ...checksResult, costUsd, wallS: elapsed() };
 }
 
 /**
@@ -1554,8 +1573,17 @@ function runRefutationRetry(task, ctx) {
  * task's scope check passed — so it's reported as a harness bug (a
  * particionado or scope-check defect), never as something the code did.
  */
-function mergeAcceptedTasks(accepted, changeWorktree) {
+/**
+ * `record`'s "closed: verified" per task fires here, one at a time, right
+ * after THAT task's own merge succeeds — not batched at the end. A merge
+ * conflict aborts only its own attempt; tasks merged earlier in this same
+ * call already exist in the change branch's history, so they get their
+ * verified event too, and only the conflicting task (and anything after it
+ * in id order) doesn't.
+ */
+function mergeAcceptedTasks(accepted, changeWorktree, record) {
   const sorted = [...accepted].sort((a, b) => compareIds(a.task.id, b.task.id));
+  const merged = [];
   for (const c of sorted) {
     const merge = runGit(
       ["merge", "--no-ff", "-m", `spec-loop: merge ${c.task.id}`, c.worktree.branch],
@@ -1563,10 +1591,19 @@ function mergeAcceptedTasks(accepted, changeWorktree) {
     );
     if (merge.code !== 0) {
       runGit(["merge", "--abort"], changeWorktree.dir);
-      return { status: "merge-conflict", failedTask: c.task.id, stderr: merge.stderr };
+      return { status: "merge-conflict", failedTask: c.task.id, stderr: merge.stderr, merged };
     }
+    record({
+      task: c.task.id,
+      event: "closed",
+      status: "verified",
+      attempts: c.attemptsUsed,
+      cost_usd: round2(c.costUsd ?? 0),
+      wall_s: c.wallS ?? 0,
+    });
+    merged.push(c);
   }
-  return { status: "merged" };
+  return { status: "merged", merged };
 }
 
 /**
@@ -1635,6 +1672,8 @@ export function runWaveBarrier(candidates, ctx) {
         attemptsUsed: c.attemptsUsed,
         refutedReason: c.refutedReason,
         testFingerprint: c.testFingerprint,
+        priorCostUsd: c.costUsd,
+        priorWallS: c.wallS,
         spawnImplementer: spawnImplementerFn,
         emit,
       }),
@@ -1645,7 +1684,12 @@ export function runWaveBarrier(candidates, ctx) {
     }
     const readyForPass2 = retried
       .filter((r) => r.result.status === "checks-passed")
-      .map((r) => ({ ...r.c, testFingerprint: r.result.testFingerprint }));
+      .map((r) => ({
+        ...r.c,
+        testFingerprint: r.result.testFingerprint,
+        costUsd: r.result.costUsd,
+        wallS: r.result.wallS,
+      }));
 
     if (readyForPass2.length > 0) {
       // Second and last pass — "máximo dos pasadas de checker por ola".
@@ -1668,7 +1712,7 @@ export function runWaveBarrier(candidates, ctx) {
     return { accepted: [], closed, proposedRules, barrierStatus: "nothing-to-merge" };
   }
 
-  const mergeResult = mergeAcceptedTasks(accepted, changeWorktree);
+  const mergeResult = mergeAcceptedTasks(accepted, changeWorktree, record);
   record({ event: "merge", ok: mergeResult.status === "merged", failedTask: mergeResult.failedTask });
   if (mergeResult.status !== "merged") {
     return { accepted, closed, proposedRules, barrierStatus: "merge-conflict", failedTask: mergeResult.failedTask };
@@ -1747,6 +1791,8 @@ function runTaskInWorker(data, spawnImplementerOverride) {
             worktree: pipelineResult.worktree,
             attemptsUsed: pipelineResult.attempts,
             testFingerprint: checksResult.testFingerprint,
+            costUsd: pipelineResult.costUsd,
+            wallS: pipelineResult.wallS,
           },
         }
       : { taskId: task.id, terminal: checksResult.status };
