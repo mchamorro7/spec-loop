@@ -551,11 +551,15 @@ export function deriveState(events) {
   const tasks = {};
   let totalCostUsd = 0;
   const proposedRules = [];
+  const changeReviewFindings = [];
   let lastRunStart = null;
+  let changeOriginalBase = null;
 
   for (const e of events ?? []) {
     if (e.event === "run_start") {
       lastRunStart = { contractHash: e.contract_hash, baseSha: e.base_sha };
+    } else if (e.event === "change_started") {
+      changeOriginalBase = e.base_sha ?? null;
     } else if (e.event === "closed" && e.task) {
       tasks[e.task] = {
         status: e.status,
@@ -569,10 +573,19 @@ export function deriveState(events) {
       totalCostUsd += e.cost_usd;
     } else if (e.event === "checker_verdict" && e.rule) {
       proposedRules.push({ taskId: e.id, rule: e.rule });
+    } else if (e.event === "change_review" && Array.isArray(e.findings)) {
+      changeReviewFindings.push(...e.findings);
     }
   }
 
-  return { tasks, totalCostUsd: round2(totalCostUsd), proposedRules, lastRunStart };
+  return {
+    tasks,
+    totalCostUsd: round2(totalCostUsd),
+    proposedRules,
+    lastRunStart,
+    changeOriginalBase,
+    changeReviewFindings,
+  };
 }
 
 /**
@@ -899,6 +912,40 @@ export function buildCheckerPrompt(waveTasks, specDeltaText, architectureText) {
 }
 
 /**
+ * What the change-level reviewer (D16) receives as its prompt: just the
+ * proposal, since the diff (base original → HEAD final) goes in over stdin
+ * like the wave checker's. Its two questions are narrow on purpose: does
+ * the accumulated diff implement the proposal as a whole, and did two waves
+ * duplicate an abstraction without knowing about each other.
+ */
+export function buildChangeReviewPrompt(proposalText) {
+  return ["## Proposal del change", proposalText?.trim() || "(vacío)"].join("\n");
+}
+
+/**
+ * Unlike a wave checker's refutation, a change-review finding with no
+ * evidence is dropped outright rather than kept-and-flagged: nothing here
+ * blocks a merge, so an unfounded finding has no report value — it would
+ * just be noise on top of the tasks a human already needs to read.
+ */
+export function validateChangeReviewFindings(rawFindings) {
+  return (rawFindings ?? [])
+    .filter(
+      (f) =>
+        f &&
+        typeof f.description === "string" &&
+        f.description.trim() !== "" &&
+        typeof f.evidence === "string" &&
+        f.evidence.trim() !== "",
+    )
+    .map((f) => ({
+      description: f.description,
+      evidence: f.evidence,
+      rule: f.rule && typeof f.rule === "object" ? f.rule : null,
+    }));
+}
+
+/**
  * Validate the checker's raw output against "Evidencia obligatoria": a
  * `refuted: true` with no evidence doesn't count as a founded refutation —
  * downgraded to non-refuting, but the reason is kept so the report can still
@@ -1017,6 +1064,11 @@ export function formatReport(changeName, tasks, state, config, runWallS) {
   for (const r of state.proposedRules) {
     const rationale = r.rule.rationale ? ` — ${r.rule.rationale}` : "";
     lines.push(`- regla propuesta por el checker (${r.taskId}): ${r.rule.ruleSource ?? "sin nombre"}${rationale}`);
+    anyResidual = true;
+  }
+  for (const f of state.changeReviewFindings ?? []) {
+    const rule = f.rule ? ` — regla propuesta: ${f.rule.ruleSource ?? "sin nombre"}` : "";
+    lines.push(`- revisor de change: ${f.description} (${f.evidence})${rule}`);
     anyResidual = true;
   }
   if (!anyResidual) lines.push("(ninguno)");
@@ -1736,6 +1788,113 @@ function runCheckerPass(candidates, ctx) {
   return { verdicts, costUsd };
 }
 
+const CHANGE_REVIEW_JSON_SCHEMA = JSON.stringify({
+  type: "object",
+  properties: {
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          evidence: { type: "string" },
+          rule: {
+            type: "object",
+            properties: {
+              file: { type: "string" },
+              ruleSource: { type: "string" },
+              rationale: { type: "string" },
+            },
+          },
+        },
+        required: ["description", "evidence"],
+      },
+    },
+  },
+  required: ["findings"],
+});
+
+/**
+ * Production change-reviewer spawn (D16): same shape as the wave checker's
+ * (read-only, no tools, the diff over stdin, structured output), a
+ * different schema. Reuses agents/verifier.md -- the role is the same
+ * "adversarial reader who refutes/finds problems," just at a wider scope
+ * and a slower cadence; task 8.2 covers both in that one file.
+ */
+function spawnChangeReviewer(promptText, diffText, checkerModel, repoRoot = REPO_ROOT) {
+  const result = spawnSync(
+    "claude",
+    [
+      "-p",
+      promptText,
+      "--append-system-prompt-file",
+      VERIFIER_MD_PATH,
+      "--model",
+      checkerModel,
+      "--max-turns",
+      DEFAULT_CHECKER_MAX_TURNS,
+      "--strict-mcp-config",
+      "--allowedTools",
+      ALLOWED_CHECKER_TOOLS,
+      "--output-format",
+      "json",
+      "--json-schema",
+      CHANGE_REVIEW_JSON_SCHEMA,
+    ],
+    { cwd: repoRoot, input: diffText, encoding: "utf8", env: subprocessEnv() },
+  );
+
+  let parsed = {};
+  try {
+    parsed = JSON.parse(result.stdout ?? "");
+  } catch {
+    parsed = {};
+  }
+  const structured = parsed.structured_output ?? parsed;
+  return {
+    findings: Array.isArray(structured?.findings) ? structured.findings : [],
+    costUsd: typeof parsed.total_cost_usd === "number" ? parsed.total_cost_usd : 0,
+  };
+}
+
+/**
+ * D16: once the change stops producing new waves and at least one task
+ * merged, one spawn over the WHOLE change's accumulated diff — never
+ * blocking, never touching a task's status or the exit code. Findings only
+ * ever reach the report's residual-risk block.
+ */
+export function runChangeReview(ctx) {
+  const {
+    changeWorktree,
+    changeOriginalBase,
+    config,
+    eventsPath,
+    proposalText,
+    spawnChangeReviewer: spawnFn = spawnChangeReviewer,
+    emit = (e) => process.stdout.write(formatEventLine(e) + "\n"),
+  } = ctx;
+
+  if (!changeOriginalBase) return { findings: [] };
+
+  const diffText = runGit(["diff", `${changeOriginalBase}..HEAD`], changeWorktree.dir).stdout;
+  if (diffText.trim() === "") return { findings: [] };
+
+  const promptText = buildChangeReviewPrompt(proposalText);
+  const { findings: raw, costUsd } = spawnFn(promptText, diffText, config.checkerModel);
+  const findings = validateChangeReviewFindings(raw);
+
+  const reviewEvent = { ts: new Date().toISOString(), event: "change_review", findings };
+  appendEvent(eventsPath, reviewEvent);
+  emit(reviewEvent);
+  // Same event type the wave checker uses -- deriveState already sums it
+  // into the run's total cost without needing to know this call exists.
+  const spendEvent = { ts: new Date().toISOString(), event: "checker_spend", cost_usd: round2(costUsd) };
+  appendEvent(eventsPath, spendEvent);
+  emit(spendEvent);
+
+  return { findings };
+}
+
 /**
  * The one re-implementation a refuted task gets: one more spawn in the same
  * worktree (never a fresh one -- the accepted commit stays), one more
@@ -2215,6 +2374,15 @@ async function run() {
 
   appendEvent(eventsPath, { event: "run_start", contract_hash: contractHash, base_sha: baseSha });
 
+  // D16: the change-level reviewer needs the ORIGINAL base (before any wave
+  // ever ran), not any wave's base -- D6 rereads that every wave, so it's
+  // useless for a diff spanning the whole change. Recorded once, the first
+  // time this change's worktree is created; baseSha is exactly that ref,
+  // since nothing between here and ensureChangeWorktree touches REPO_ROOT's HEAD.
+  if (!existsSync(changeWorktreeDir(REPO_ROOT))) {
+    appendEvent(eventsPath, { event: "change_started", base_sha: baseSha });
+  }
+
   const changeWorktree = ensureChangeWorktree(changeName, REPO_ROOT);
   const specDeltaText = collectMarkdown(join(changeDir, "specs"));
   const architectureText = readIfExists(join(REPO_ROOT, "openspec", "architecture.md")) ?? "";
@@ -2291,7 +2459,7 @@ async function run() {
     waves = recalced;
   }
 
-  const finalEvents = readEventsLog(eventsPath);
+  let finalEvents = readEventsLog(eventsPath);
   let finalState = deriveState(finalEvents);
   finalState = crossCheckVerifiedAgainstGit(finalState, changeWorktree);
 
@@ -2300,6 +2468,21 @@ async function run() {
     .map(([id]) => id);
   const projectedTasksText = projectCheckboxes(tasksText, finalVerifiedIds);
   if (projectedTasksText !== tasksText) writeFileSync(tasksPath, projectedTasksText);
+
+  // D16: once, over the whole change's accumulated diff -- never blocks,
+  // never touches a task's status. Only worth running if something merged.
+  if (finalVerifiedIds.length > 0) {
+    runChangeReview({
+      changeWorktree,
+      changeOriginalBase: finalState.changeOriginalBase,
+      config,
+      eventsPath,
+      proposalText: readIfExists(join(changeDir, "proposal.md")) ?? "",
+    });
+    finalEvents = readEventsLog(eventsPath);
+    finalState = deriveState(finalEvents);
+    finalState = crossCheckVerifiedAgainstGit(finalState, changeWorktree);
+  }
 
   const reportText = formatReport(changeName, allTasks, finalState, config, estimateRunWallS(finalEvents));
   process.stdout.write(reportText);

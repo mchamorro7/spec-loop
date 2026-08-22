@@ -1,6 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildCheckerPrompt, validateCheckerVerdicts, propagateBlockedByDep } from "../bin/spec-loop.mjs";
+import {
+  buildCheckerPrompt,
+  validateCheckerVerdicts,
+  propagateBlockedByDep,
+  buildChangeReviewPrompt,
+  validateChangeReviewFindings,
+} from "../bin/spec-loop.mjs";
 
 test("buildCheckerPrompt: includes the spec delta, architecture decisions, and each task's proves", () => {
   const prompt = buildCheckerPrompt(
@@ -102,4 +108,43 @@ test("propagateBlockedByDep: mergedIds lets a survivor depending on an earlier-w
   assert.deepEqual(errors, []);
   assert.deepEqual(blockedByDep, []);
   assert.deepEqual(waves.flat().map((t) => t.id), ["3.1"]);
+});
+
+test("buildChangeReviewPrompt: includes the proposal text", () => {
+  const prompt = buildChangeReviewPrompt("## Why\nAdd auth so users can log in.");
+  assert.match(prompt, /Add auth so users can log in/);
+});
+
+test("buildChangeReviewPrompt: an empty proposal says so explicitly, not silently blank", () => {
+  assert.match(buildChangeReviewPrompt(""), /vacío/);
+  assert.match(buildChangeReviewPrompt(undefined), /vacío/);
+});
+
+test("validateChangeReviewFindings: a finding with evidence passes through", () => {
+  const findings = validateChangeReviewFindings([
+    { description: "wave 1 and wave 3 both define a Session type", evidence: "src/a.ts:3, src/b.ts:9" },
+  ]);
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].rule, null);
+});
+
+test("validateChangeReviewFindings: a finding with no evidence is dropped, not kept-and-flagged", () => {
+  const findings = validateChangeReviewFindings([
+    { description: "something might be off", evidence: "" },
+    { description: "", evidence: "src/a.ts:1" },
+  ]);
+  assert.deepEqual(findings, []);
+});
+
+test("validateChangeReviewFindings: carries a proposed lint rule through when present", () => {
+  const [f] = validateChangeReviewFindings([
+    { description: "x", evidence: "y", rule: { ruleSource: "no-dup-types", rationale: "z" } },
+  ]);
+  assert.equal(f.rule.ruleSource, "no-dup-types");
+});
+
+test("validateChangeReviewFindings: an empty or malformed input is an empty list, not a crash", () => {
+  assert.deepEqual(validateChangeReviewFindings([]), []);
+  assert.deepEqual(validateChangeReviewFindings(undefined), []);
+  assert.deepEqual(validateChangeReviewFindings([null, "not an object"]), []);
 });

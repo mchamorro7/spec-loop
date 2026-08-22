@@ -193,6 +193,51 @@ decisión humana o una tarea de un change posterior.
 - **WHEN** el checker quiere aplicar la regla que propone
 - **THEN** no puede, porque es de solo lectura y ningún archivo del proyecto está en su alcance
 
+### Requirement: Revisor de change
+
+El checker de ola ve una ola a la vez: nunca tiene, dentro de una misma invocación, el diff de una
+ola anterior ya mergeada. Una tarea de la ola 3 puede duplicar sin saberlo una abstracción que la
+ola 1 ya creó, y ningún mecanismo del harness lo ve — ni el gate, ni el checker de ninguna ola por
+separado.
+
+Una vez que el change deja de generar olas nuevas — porque no queda nada por correr, porque se
+agotó el presupuesto, o porque se detuvo — y al menos una tarea quedó mergeada, el runner SHALL
+invocar un checker fresco una única vez sobre el diff acumulado del change completo: desde la base
+original (el HEAD del repo cuando el change arrancó, no la base de ninguna ola) hasta el HEAD final
+de la rama del change.
+
+El revisor SHALL responder, en orden: si el diff acumulado implementa el proposal del change como
+un todo; y si dos o más olas introdujeron una abstracción duplicada sin coordinarse. SHALL proponer
+una regla de linter cuando un hallazgo sea mecanizable, con el mismo trinquete del checker de ola.
+
+Su veredicto SHALL ser puramente informativo: SHALL NO bloquear ni revertir el merge de ninguna
+tarea — todas las que va a revisar ya están mergeadas — y SHALL NO alterar el exit code del run.
+Sus hallazgos SHALL aparecer en el bloque de riesgo residual del reporte, nunca junto a las tareas
+rojas ni contados como si hubieran fallado un check.
+
+#### Scenario: Una sola vez, sin importar cuántas olas hubo
+
+- **WHEN** el change tiene cinco olas
+- **THEN** el revisor de change se invoca una única vez, sobre el diff acumulado completo, no una
+  vez por ola
+
+#### Scenario: No bloquea nada
+
+- **WHEN** el revisor de change encuentra un problema
+- **THEN** el reporte lo señala como riesgo residual, pero ninguna tarea cambia de estado y el
+  exit code no se ve afectado
+
+#### Scenario: Duplicación entre olas que ningún checker de ola podía ver
+
+- **WHEN** la ola 1 crea una abstracción y la ola 3, sin saberlo, crea una parecida
+- **THEN** el revisor de change lo detecta sobre el diff acumulado, porque el checker de la ola 3
+  nunca vio el diff de la ola 1
+
+#### Scenario: Sin tareas mergeadas, no corre
+
+- **WHEN** el change termina sin ninguna tarea mergeada
+- **THEN** el revisor de change no corre — no hay diff acumulado que revisar
+
 ### Requirement: Gate y suite
 
 El comando de gate configurado SHALL correr dentro de cada `verify`, y SHALL ser el lugar donde

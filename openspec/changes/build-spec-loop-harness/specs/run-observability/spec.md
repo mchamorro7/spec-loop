@@ -124,7 +124,8 @@ archivo del change, en este orden:
 
 1. Tareas rojas, con su estado, la razón registrada y qué decisión humana las destraba.
 2. Riesgo residual: tareas con `red-check: skip` y su razón, NFR de juicio que quedaron sin
-   verificar, y reglas de linter propuestas por el checker que todavía no están en el gate.
+   verificar, reglas de linter propuestas por el checker que todavía no están en el gate, y los
+   hallazgos del revisor de change sobre el diff acumulado.
 3. Advertencias: tareas que cerraron en el último intento disponible o después de una refutación.
 4. Tareas verdes, una línea por tarea con id, intentos, duración y costo.
 5. Totales: costo del change, aceleración contra secuencial y tasa de éxito al primer intento.

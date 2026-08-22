@@ -266,6 +266,43 @@ el mismo agente marca). Este harness la resuelve con MENOS: siete de sus ocho ca
 verificación ya son deterministas: `checker-model` refuerza la única que no lo es, en vez de
 agregar una capa de juicio nueva.
 
+### D16 · Revisor de change: el hueco cross-ola, cerrado con la misma pieza que ya existe
+
+El checker de ola resuelve su pregunta (c) — *"¿rompe algo que el gate no puede ver?"* — mirando
+los N diffs de **una** ola. Nunca ve la ola anterior, porque `taskDiffBlock` calcula el diff contra
+`baseRef`, que D6 relee al arrancar cada ola. Una abstracción que la ola 1 crea y que la ola 3
+duplica sin saberlo no la caza nada: no el gate (no tipa duplicación), no el checker de la ola 3 (no
+vio el diff de la ola 1), no el reporte (cada tarea, mirada sola, está bien).
+
+Revisando [aaif-goose/goose](https://github.com/aaif-goose/goose) — Linux Foundation, ex-Block,
+2397 archivos, sin relación con este proyecto — para responder si paralelizar sin perder calidad
+era un problema resuelto en otro lado, aparece la misma respuesta que ya había dado gstack:
+`code-review.yaml` revisa el diff **completo de un PR contra la base**, una vez, con instrucciones
+acotadas (*"don't add feedback outside the scope of the instructions"*, *"avoid nit-pick
+comments"*). Es la tercera vez, en dos proyectos grandes e independientes, que aparece el mismo
+patrón: verificar por unidad de trabajo no alcanza, hace falta una pasada sobre el diff acumulado.
+
+**Decisión:** un revisor de change, no una pieza nueva — el mismo checker (mismo spawn, mismo
+schema JSON, misma regla de evidencia obligatoria, mismo trinquete de proponer una regla de
+linter), corriendo con un scope distinto y una cadencia distinta:
+
+| | Checker de ola (ya existe) | Revisor de change (nuevo) |
+|---|---|---|
+| Cadencia | una vez por ola | **una vez por change**, sin importar cuántas olas hubo |
+| Ve | los N diffs de la ola actual | el diff acumulado, base original → HEAD final |
+| Bloquea merge | sí — refutar dispara un reintento | **no** — todo lo que revisa ya está mergeado |
+| Efecto en el exit code | si | **ninguno** — es puramente informativo |
+| Dónde aparece | veredicto por tarea | bloque de riesgo residual del reporte |
+
+**Por qué no es una auditoría de seguridad ni un `/cso`:** el scope queda a propósito angosto —
+¿el diff acumulado cumple el proposal como un todo?, ¿alguna ola duplicó algo que otra ya hizo?,
+¿algo es mecanizable? Nada de OWASP, nada de UX, nada de performance: la frontera del harness
+(§task-contract, "una tarea existe solo si su done es un exit code determinista") sigue vigente acá
+también. Ensancharlo sería exactamente el over-engineering que este documento existe para evitar.
+
+**Por qué el costo es marginal:** un spawn por change entero, no por ola — más barato que el propio
+checker de ola en cualquier change de más de una ola.
+
 ## Risks / Trade-offs
 
 | Riesgo | Trade-off aceptado |

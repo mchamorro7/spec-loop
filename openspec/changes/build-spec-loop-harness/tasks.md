@@ -54,6 +54,7 @@
 - [x] 6.4 Suite del proyecto sobre la rama del change, siempre con concurrencia 1; roja → detener el change sin revertir nada. Después, correr el comando de chequeo caro si está declarado, con la misma política
 - [x] 6.5 Propagar bloqueo por clausura de `needs` sobre tareas rojas y recalcular las olas restantes
 - [x] 6.6 Habilitar concurrencia mayor a 1 con un pool del tamaño de `jobs`
+- [x] 6.7 Revisor de change (D16): un spawn al final del run, sobre el diff acumulado desde la base original hasta el HEAD final; informativo, no bloquea ni cambia el exit code; hallazgos al bloque de riesgo residual
 
 ## 7. Estado, reporte y salida
 
@@ -69,7 +70,7 @@
 ## 8. Agentes
 
 - [ ] 8.1 `agents/implementer.md`: un intento, una tarea, sin auto-evaluación, sin commitear, sin tocar lo que no posee, señal explícita de alcance insuficiente, y los dos guardrails de prompt (no asumir que algo no está implementado; nada de placeholders ni stubs)
-- [ ] 8.2 `agents/verifier.md`: refutar en vez de revisar, solo lectura, orden de lectura obligatorio, las CUATRO preguntas incluida la de decisiones de arquitectura sobre el diff acumulado, evidencia como referencia a archivo y línea o salida de comando, y el trinquete: proponer la regla de linter sin escribirla
+- [ ] 8.2 `agents/verifier.md`: dos roles en el mismo archivo — (a) checker de ola: refutar en vez de revisar, orden de lectura obligatorio, las cuatro preguntas incluida arquitectura sobre el diff acumulado de la ola; (b) revisor de change (D16): el diff acumulado del change completo, las dos preguntas (proposal como un todo, duplicación entre olas), sin veredicto que bloquee. Ambos: solo lectura, evidencia como archivo:línea o salida de comando, y el trinquete de proponer regla de linter sin escribirla
 
 ## 9. Skills de planificación
 

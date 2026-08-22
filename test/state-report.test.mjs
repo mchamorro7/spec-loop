@@ -69,6 +69,23 @@ test("deriveState: the latest run_start is exposed for the retry-delta check", (
   assert.deepEqual(state.lastRunStart, { contractHash: "bbb", baseSha: "sha2" });
 });
 
+test("deriveState: change_started exposes the change's original base (D16)", () => {
+  const state = deriveState([{ event: "change_started", base_sha: "sha-original" }]);
+  assert.equal(state.changeOriginalBase, "sha-original");
+});
+
+test("deriveState: without a change_started event, changeOriginalBase is null, not a crash", () => {
+  assert.equal(deriveState([]).changeOriginalBase, null);
+});
+
+test("deriveState: change_review findings accumulate across multiple events", () => {
+  const state = deriveState([
+    { event: "change_review", findings: [{ description: "a", evidence: "e1" }] },
+    { event: "change_review", findings: [{ description: "b", evidence: "e2" }] },
+  ]);
+  assert.equal(state.changeReviewFindings.length, 2);
+});
+
 function task(overrides = {}) {
   return {
     id: "1.1",
@@ -182,6 +199,32 @@ test("formatReport: a proposed lint rule appears in residual risk", () => {
   const out = formatReport("add-x", [], state, { maxAttempts: 3 }, 10);
   assert.match(out, /no-restricted-imports/);
   assert.match(out, /UI no debe importar db/);
+});
+
+test("formatReport: change-reviewer findings appear in residual risk, with their evidence", () => {
+  const state = stateWith({}, {
+    changeReviewFindings: [
+      { description: "wave 1 and wave 3 both define a Session type", evidence: "src/a.ts:3, src/b.ts:9", rule: null },
+    ],
+  });
+  const out = formatReport("add-x", [], state, { maxAttempts: 3 }, 10);
+  const riskIdx = out.indexOf("## Riesgo residual");
+  const nextSection = out.indexOf("## Advertencias");
+  const block = out.slice(riskIdx, nextSection);
+  assert.match(block, /wave 1 and wave 3 both define a Session type/);
+  assert.match(block, /src\/a\.ts:3, src\/b\.ts:9/);
+});
+
+test("formatReport: a change-reviewer finding never appears in Rojo or changes the totals", () => {
+  const state = stateWith(
+    { "1.1": { status: "verified", attempts: 1, costUsd: 0.1, wallS: 30, reason: null } },
+    { changeReviewFindings: [{ description: "x", evidence: "y", rule: null }], totalCostUsd: 0.1 },
+  );
+  const out = formatReport("add-x", [task({ id: "1.1" })], state, { maxAttempts: 3 }, 30);
+  const redIdx = out.indexOf("## Rojo");
+  const riskIdx = out.indexOf("## Riesgo residual");
+  assert.doesNotMatch(out.slice(redIdx, riskIdx), /description|evidence/);
+  assert.match(out, /costo: \$0\.10/);
 });
 
 test("formatReport: a task that closed on the last attempt is a warning", () => {
